@@ -114,6 +114,47 @@ def _sanitize_run_id(run_id: str) -> str:
     return sanitized or "run"
 
 
+def _recover_killed_runs(cache_root: str, target_db: str, current_run_dir: str) -> None:
+    """Merge data from runs that were killed before finalize() could run.
+
+    A killed run has rank_*.db files with committed rows but no .merged marker.
+    We merge those rows into cache.db at startup so the next run can serve them
+    from shared_db_path instead of re-running inference.
+    """
+    run_root = os.path.join(cache_root, _LAYERED_RUNS_DIRNAME)
+    if not os.path.isdir(run_root):
+        return
+    lock_dir = os.path.join(run_root, _LAYERED_LOCK_DIRNAME)
+    target_audit = os.path.join(cache_root, "cache.audit.jsonl")
+
+    for entry in sorted(os.scandir(run_root), key=lambda e: e.name):
+        if not entry.is_dir() or entry.path == current_run_dir:
+            continue
+        if os.path.exists(os.path.join(entry.path, _LAYERED_MERGED_MARKER)):
+            continue
+        rank_dbs = sorted(glob(os.path.join(entry.path, "rank_*.db")))
+        rank_audits = sorted(glob(os.path.join(entry.path, "rank_*.audit.jsonl")))
+        if not rank_dbs:
+            continue
+        # Only bother if at least one db has rows.
+        has_data = any(
+            sqlite3.connect(db, timeout=5).execute("SELECT COUNT(*) FROM responses").fetchone()[0] > 0
+            for db in rank_dbs
+            if os.path.getsize(db) > 0
+        )
+        if not has_data:
+            continue
+        try:
+            with _merge_lock(lock_dir, timeout_seconds=10):
+                merged = ResponseCache.merge_shards(rank_dbs, target_db)
+                if rank_audits:
+                    ResponseCache.merge_audit_logs(rank_audits, target_audit)
+                _touch_text(os.path.join(entry.path, _LAYERED_MERGED_MARKER), f"{time.time():.6f}\n")
+                eval_logger.info(f"ResponseCache: recovered {merged} entries from killed run {entry.name}")
+        except Exception as exc:
+            eval_logger.warning(f"ResponseCache: recovery merge failed for {entry.name}: {exc}")
+
+
 def _resolve_cache_run_id(world_size: int) -> str:
     for env_key in _CACHE_RUN_ID_ENV_KEYS:
         env_value = os.environ.get(env_key)
@@ -449,6 +490,12 @@ class ResponseCache:
 
         # Determine write paths based on FS type
         target_db = os.path.join(cache_root, "cache.db")
+
+        # Recover data from any runs that were killed before finalize() ran.
+        # Those runs have rank_*.db files with committed data but no .merged marker.
+        if global_rank == 0:
+            _recover_killed_runs(cache_root, target_db, run_dir)
+
         shared_db_path = target_db if os.path.exists(target_db) else None
 
         target_fs = detect_fs_type(cache_root)
