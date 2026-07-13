@@ -43,8 +43,12 @@ class Qwen2_5_VL(Qwen2_5_VLSimple):
             grouping=True,
         )
         chunks = re_ords.get_batched(n=self.batch_size, batch_fn=None)
-        num_iters = len(requests) // self.batch_size if len(requests) % self.batch_size == 0 else len(requests) // self.batch_size + 1
-        pbar = tqdm(total=num_iters, disable=(self.rank != 0), desc="Model Responding")
+        # Count samples (not batches) so progress can start at the number of
+        # samples already served from the response cache in a resumed run
+        # (e.g. 25/3040 instead of 0/3015). ResponseCache.execute() sets the
+        # offset; without a cache it is 0 and the bar behaves as before.
+        n_cached = getattr(self, "_cache_progress_offset", 0)
+        pbar = tqdm(total=len(requests) + n_cached, initial=n_cached, disable=(self.rank != 0), desc="Model Responding")
         total_elapsed_time = 0
         total_tokens = 0
         for chunk in chunks:
@@ -172,7 +176,7 @@ class Qwen2_5_VL(Qwen2_5_VLSimple):
                 eval_logger.debug(f"Question: {context}")
                 eval_logger.debug(f"Model Response: {ans}")
             # reorder this group of results back to original unsorted form
-            pbar.update(1)
+            pbar.update(len(chunk))
         res = re_ords.get_original(res)
 
         # Calculate average speed

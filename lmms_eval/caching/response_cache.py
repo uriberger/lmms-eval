@@ -481,7 +481,11 @@ class ResponseCache:
             model_args_fp = str(model_args)
         model_fp = f"{model}|{model_args_fp}"
         model_hash = hash_string(model_fp)[:16]
-        eval_version = get_lmms_eval_cache_version()
+        # LMMS_CACHE_EVAL_VERSION pins the version component of cache keys.
+        # The default (git commit hash in dev checkouts) invalidates the entire
+        # cache on every commit; pin a fixed string to keep entries valid across
+        # commits and bump it manually when a change actually alters outputs.
+        eval_version = os.environ.get("LMMS_CACHE_EVAL_VERSION", "").strip() or get_lmms_eval_cache_version()
 
         # Create directories
         os.makedirs(cache_root, exist_ok=True)
@@ -871,6 +875,12 @@ class ResponseCache:
             self._add_partial_pending = _partial_pending
             self._add_partial_by_doc = _partial_by_doc
             self._add_partial_stored: set = set()
+            # Let the model's progress bar start at the number of samples already
+            # served from cache, so resumed runs show e.g. 25/3040 instead of 0/3015.
+            try:
+                lm._cache_progress_offset = len(requests) - len(uncached)
+            except (AttributeError, TypeError):
+                pass
             _old_hook = getattr(lm, "cache_hook", None)
             try:
                 lm.set_cache_hook(self)
@@ -886,30 +896,36 @@ class ResponseCache:
                     pass
             self._add_partial_pending = {}
             self._add_partial_by_doc = {}
+            try:
+                lm._cache_progress_offset = 0
+            except (AttributeError, TypeError):
+                pass
 
             for (idx_pos, req, resp), (cache_key, deterministic, ch, tf, gen_kwargs) in zip(
                 zip(uncached_indices, uncached, new_resps), _uncached_meta
             ):
                 results[idx_pos] = resp
                 cacheable = self._extract_cacheable(resp)
-                self._log_to_audit(
-                    reqtype,
-                    req.task_name,
-                    req.doc_id,
-                    req.idx,
-                    gen_kwargs,
-                    cacheable,
-                    cache_key=cache_key,
-                    deterministic=deterministic,
-                    task_fingerprint=tf,
-                    content_hash=ch,
-                    model_fingerprint_hash=self._model_fingerprint_hash,
-                )
-                # _store() is idempotent (INSERT OR REPLACE), but skip the
-                # checkpoint counter bump for items add_partial() already stored.
+                # add_partial() already wrote the audit record and DB row for
+                # the items it stored; only the counters below still apply.
+                already_stored = cache_key in self._add_partial_stored
+                if not already_stored:
+                    self._log_to_audit(
+                        reqtype,
+                        req.task_name,
+                        req.doc_id,
+                        req.idx,
+                        gen_kwargs,
+                        cacheable,
+                        cache_key=cache_key,
+                        deterministic=deterministic,
+                        task_fingerprint=tf,
+                        content_hash=ch,
+                        model_fingerprint_hash=self._model_fingerprint_hash,
+                    )
                 if deterministic and self._is_valid_response(resp, reqtype):
-                    already_stored = cache_key in self._add_partial_stored
-                    self._store(cache_key, reqtype, req.task_name, req.doc_id, req.idx, gen_kwargs, cacheable)
+                    if not already_stored:
+                        self._store(cache_key, reqtype, req.task_name, req.doc_id, req.idx, gen_kwargs, cacheable)
                     if self._use_scratch and not already_stored:
                         self._entries_since_checkpoint += 1
                         if self._entries_since_checkpoint >= self._checkpoint_interval:
@@ -975,7 +991,23 @@ class ResponseCache:
         cacheable = self._extract_cacheable(res)
         if not self._is_valid_response(res, attr):
             return
-        self._store(cache_key, attr, unc_req.task_name, unc_req.doc_id, unc_req.idx, extract_gen_kwargs(unc_req), cacheable)
+        gen_kwargs = extract_gen_kwargs(unc_req)
+        # Audit first, then SQLite (the documented crash-safe write order).
+        # Without the audit record a row cannot be re-keyed by rekey_cache.py.
+        self._log_to_audit(
+            attr,
+            unc_req.task_name,
+            unc_req.doc_id,
+            unc_req.idx,
+            gen_kwargs,
+            cacheable,
+            cache_key=cache_key,
+            deterministic=deterministic,
+            task_fingerprint=self._task_fingerprints.get(unc_req.task_name, ""),
+            content_hash=_extract_content_hash(unc_req),
+            model_fingerprint_hash=self._model_fingerprint_hash,
+        )
+        self._store(cache_key, attr, unc_req.task_name, unc_req.doc_id, unc_req.idx, gen_kwargs, cacheable)
         stored = getattr(self, "_add_partial_stored", None)
         if stored is not None:
             stored.add(cache_key)
