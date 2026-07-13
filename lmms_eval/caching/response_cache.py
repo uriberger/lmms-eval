@@ -596,8 +596,12 @@ class ResponseCache:
         os.makedirs(os.path.dirname(self.db_path), exist_ok=True)
         os.makedirs(os.path.dirname(self.audit_path), exist_ok=True)
         self.db = sqlite3.connect(self.db_path, timeout=30)
-        self.db.execute("PRAGMA journal_mode=WAL")
-        self.db.execute("PRAGMA synchronous=NORMAL")
+        # Use DELETE journal mode instead of WAL: WAL requires a working -shm
+        # file (shared memory) which is unreliable on network filesystems like
+        # Lustre/NFS.  DELETE mode writes each commit directly to the db file,
+        # so killed runs leave intact rows rather than an unrecoverable WAL.
+        self.db.execute("PRAGMA journal_mode=DELETE")
+        self.db.execute("PRAGMA synchronous=FULL")
         self.db.executescript(_SCHEMA_SQL)
 
         if self.model_fingerprint:
