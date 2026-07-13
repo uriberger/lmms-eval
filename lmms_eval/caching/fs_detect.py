@@ -183,18 +183,14 @@ def find_local_scratch(min_free_gb: float = 1.0) -> Optional[str]:
 
     Returns the first usable directory found, or ``None`` if none qualify.
     """
-    candidates = []
-
-    # 1. Explicit user override
+    # If LMMS_LOCAL_CACHE is explicitly set, treat it as the sole candidate —
+    # don't fall through to /tmp etc.  Setting it to a non-existent path (e.g.
+    # /nonexistent) is a supported way to force direct writes to the target FS.
     env_path = os.environ.get("LMMS_LOCAL_CACHE")
-    if env_path:
-        candidates.append(env_path)
-
-    # 2. Common HPC scratch paths
-    candidates.extend(["/local/scratch", "/scratch"])
-
-    # 3. /tmp as fallback (always exists on POSIX)
-    candidates.append("/tmp")
+    if env_path is not None:
+        candidates = [env_path]
+    else:
+        candidates = ["/local/scratch", "/scratch", "/tmp"]
 
     for path in candidates:
         if os.path.isdir(path) and os.access(path, os.W_OK):
