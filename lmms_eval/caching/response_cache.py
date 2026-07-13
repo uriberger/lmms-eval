@@ -36,6 +36,7 @@ import sqlite3
 import time
 import urllib.parse
 import uuid
+from collections import deque
 from contextlib import contextmanager
 from functools import partial
 from glob import glob
@@ -69,7 +70,7 @@ _CACHE_RUN_ID_ENV_KEYS = ("LMMS_CACHE_RUN_ID", "SLURM_JOB_ID", "TORCHELASTIC_RUN
 _LAYERED_READY_MARKER = ".ready"
 _LAYERED_MERGED_MARKER = ".merged"
 _LAYERED_LOCK_DIRNAME = ".merge.lock"
-_CHECKPOINT_INTERVAL = 256  # responses between crash-safety checkpoints
+_CHECKPOINT_INTERVAL = 10  # responses between crash-safety checkpoints
 _CHECKPOINT_INTERVAL_ENV = "LMMS_CACHE_CHECKPOINT_INTERVAL"
 
 _FUNC_ADDR_RE = re.compile(r" at 0x[0-9a-fA-F]+>")
@@ -828,29 +829,69 @@ class ResponseCache:
             eval_logger.info(f"ResponseCache: {n_hit_this_batch}/{len(requests)} cache hits ({self._skipped} non-deterministic skipped)")
 
         if uncached:
-            new_resps = getattr(lm, reqtype)(uncached)
-            for idx_pos, req, resp in zip(uncached_indices, uncached, new_resps):
-                results[idx_pos] = resp
-                cacheable = self._extract_cacheable(resp)
-                gen_kwargs = extract_gen_kwargs(req)
-                deterministic = is_deterministic(reqtype, gen_kwargs)
-                ch = _extract_content_hash(req)
-                tf = self._task_fingerprints.get(req.task_name, "")
-                cache_key = (
+            # Pre-compute metadata for each uncached request so we can write
+            # incrementally via add_partial() as the model processes each sample,
+            # instead of waiting for the full batch to return.
+            _uncached_meta = []
+            _partial_pending: Dict[tuple, deque] = {}
+            _partial_by_doc: Dict[tuple, deque] = {}
+            for unc_req in uncached:
+                unc_gk = extract_gen_kwargs(unc_req)
+                unc_det = is_deterministic(reqtype, unc_gk)
+                unc_ch = _extract_content_hash(unc_req)
+                unc_tf = self._task_fingerprints.get(unc_req.task_name, "")
+                unc_key = (
                     compute_cache_key(
                         request_type=reqtype,
-                        task_name=req.task_name,
-                        doc_id=req.doc_id,
-                        gen_kwargs=gen_kwargs,
-                        idx=req.idx,
-                        content_hash=ch,
-                        task_fingerprint=tf,
+                        task_name=unc_req.task_name,
+                        doc_id=unc_req.doc_id,
+                        gen_kwargs=unc_gk,
+                        idx=unc_req.idx,
+                        content_hash=unc_ch,
+                        task_fingerprint=unc_tf,
                         model_fingerprint_hash=self._model_fingerprint_hash,
                         eval_version=self._eval_version,
                     )
-                    if deterministic
+                    if unc_det
                     else ""
                 )
+                _uncached_meta.append((unc_key, unc_det, unc_ch, unc_tf, unc_gk))
+                ctx = unc_req.args[0] if unc_req.args and isinstance(unc_req.args[0], str) else ""
+                pkey = (ctx, canonicalize_gen_kwargs(unc_gk))
+                if pkey not in _partial_pending:
+                    _partial_pending[pkey] = deque()
+                _partial_pending[pkey].append((unc_req, unc_key, unc_det))
+                dkey = (unc_req.task_name, unc_req.doc_id)
+                if dkey not in _partial_by_doc:
+                    _partial_by_doc[dkey] = deque()
+                _partial_by_doc[dkey].append((unc_req, unc_key, unc_det))
+
+            # Install ourselves as the model's cache hook so add_partial() fires
+            # after each sample, giving us crash-safe per-sample writes.
+            self._add_partial_pending = _partial_pending
+            self._add_partial_by_doc = _partial_by_doc
+            self._add_partial_stored: set = set()
+            _old_hook = getattr(lm, "cache_hook", None)
+            try:
+                lm.set_cache_hook(self)
+            except (AttributeError, TypeError):
+                _old_hook = None
+
+            new_resps = getattr(lm, reqtype)(uncached)
+
+            if _old_hook is not None:
+                try:
+                    lm.set_cache_hook(_old_hook)
+                except (AttributeError, TypeError):
+                    pass
+            self._add_partial_pending = {}
+            self._add_partial_by_doc = {}
+
+            for (idx_pos, req, resp), (cache_key, deterministic, ch, tf, gen_kwargs) in zip(
+                zip(uncached_indices, uncached, new_resps), _uncached_meta
+            ):
+                results[idx_pos] = resp
+                cacheable = self._extract_cacheable(resp)
                 self._log_to_audit(
                     reqtype,
                     req.task_name,
@@ -864,9 +905,12 @@ class ResponseCache:
                     content_hash=ch,
                     model_fingerprint_hash=self._model_fingerprint_hash,
                 )
+                # _store() is idempotent (INSERT OR REPLACE), but skip the
+                # checkpoint counter bump for items add_partial() already stored.
                 if deterministic and self._is_valid_response(resp, reqtype):
+                    already_stored = cache_key in self._add_partial_stored
                     self._store(cache_key, reqtype, req.task_name, req.doc_id, req.idx, gen_kwargs, cacheable)
-                    if self._use_scratch:
+                    if self._use_scratch and not already_stored:
                         self._entries_since_checkpoint += 1
                         if self._entries_since_checkpoint >= self._checkpoint_interval:
                             self._checkpoint_to_run_dir()
@@ -889,6 +933,56 @@ class ResponseCache:
             eval_logger.debug(f"ResponseCache: checkpoint to {self._remote_rank_db}")
         except Exception as e:
             eval_logger.warning(f"ResponseCache: checkpoint failed: {e}")
+
+    def add_partial(self, attr: str, req_key, res) -> None:
+        """Per-sample write hook called by models after each generated response.
+
+        Models call ``self.cache_hook.add_partial(reqtype, (context, gen_kwargs), ans)``
+        inside their generation loop.  By temporarily installing ``ResponseCache``
+        as the cache hook in ``execute()``, we get a crash-safe per-sample write
+        instead of waiting for the full batch to return.
+
+        Matching the reported answer back to its request supports two key forms:
+
+        - ``(context, gen_kwargs, {"task": ..., "split": ..., "doc_id": ...})``:
+          exact identity matching via ``(task_name, doc_id)``.  Used by patched
+          chat models, whose ``context`` is the chat-template output and thus
+          never equals the raw ``Instance.args[0]`` this cache indexes by.
+        - ``(context, gen_kwargs)``: legacy text matching against ``args[0]``.
+          Works for simple models, which pass the raw context verbatim.
+        """
+        pending = getattr(self, "_add_partial_pending", None)
+        by_doc = getattr(self, "_add_partial_by_doc", None)
+        if not pending and not by_doc:
+            return
+        try:
+            context, gen_kwargs, *rest = req_key
+        except (TypeError, ValueError):
+            return
+        ident = rest[0] if rest and isinstance(rest[0], dict) else None
+        if ident is not None and by_doc:
+            dkey = (ident.get("task"), ident.get("doc_id"))
+            items = by_doc.get(dkey)
+        else:
+            gk_str = canonicalize_gen_kwargs(gen_kwargs if isinstance(gen_kwargs, dict) else {})
+            pkey = (context if isinstance(context, str) else "", gk_str)
+            items = pending.get(pkey) if pending else None
+        if not items:
+            return
+        unc_req, cache_key, deterministic = items.popleft()
+        if not deterministic or not cache_key:
+            return
+        cacheable = self._extract_cacheable(res)
+        if not self._is_valid_response(res, attr):
+            return
+        self._store(cache_key, attr, unc_req.task_name, unc_req.doc_id, unc_req.idx, extract_gen_kwargs(unc_req), cacheable)
+        stored = getattr(self, "_add_partial_stored", None)
+        if stored is not None:
+            stored.add(cache_key)
+        if self._use_scratch:
+            self._entries_since_checkpoint += 1
+            if self._entries_since_checkpoint >= self._checkpoint_interval:
+                self._checkpoint_to_run_dir()
 
     def get_stats(self) -> Dict[str, Any]:
         total_lookups = self._hits + self._misses
