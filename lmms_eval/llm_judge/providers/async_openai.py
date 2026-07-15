@@ -20,6 +20,9 @@ class AsyncOpenAIProvider(AsyncServerInterface):
         super().__init__(config)
         self.api_key = os.getenv("OPENAI_API_KEY", "")
         base_url = os.getenv("OPENAI_API_URL", "https://api.openai.com/v1")
+        # Strip /chat/completions suffix so both full-URL and base-URL env var forms work
+        if base_url.rstrip("/").endswith("/chat/completions"):
+            base_url = base_url.rstrip("/")[: -len("/chat/completions")]
         self.api_url = base_url.rstrip("/") + "/chat/completions"
 
         # Try to use async OpenAI client if available

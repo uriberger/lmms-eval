@@ -36,6 +36,9 @@ class OpenAIProvider(ServerInterface):
         super().__init__(config)
         self.api_key = os.getenv("OPENAI_API_KEY", "")
         self.base_url = os.getenv("OPENAI_API_URL", "https://api.openai.com/v1")
+        # Strip /chat/completions suffix so both full-URL and base-URL env var forms work
+        if self.base_url.rstrip("/").endswith("/chat/completions"):
+            self.base_url = self.base_url.rstrip("/")[: -len("/chat/completions")]
 
         # Initialize OpenAI client
         try:
