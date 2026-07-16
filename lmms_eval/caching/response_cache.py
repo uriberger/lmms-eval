@@ -1204,7 +1204,8 @@ class ResponseCache:
         Returns the number of entries inserted.
         """
         out_db = sqlite3.connect(output_path, timeout=30)
-        out_db.execute("PRAGMA journal_mode=WAL")
+        out_db.execute("PRAGMA journal_mode=DELETE")
+        out_db.execute("PRAGMA synchronous=FULL")
         out_db.executescript(_SCHEMA_SQL)
 
         total = 0
