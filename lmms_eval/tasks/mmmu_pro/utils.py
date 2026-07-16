@@ -93,13 +93,46 @@ def mmmu_pro_doc_to_visual(doc):
 
 
 # MMMU-PRO's all questions are multiple-choice questions
+# Matches the explicit final answer the *_cot prompts request:
+# "The last line of your response should be ... 'Answer: $LETTER'".
+# Tolerates markdown emphasis and brackets, e.g. "**Answer:** (B)".
+_EXPLICIT_ANSWER_RE = re.compile(r"[Aa]nswer\s*:\s*\**\s*\(?\s*([A-Z])\s*\)?")
+
+
+def extract_explicit_answer(pred, all_choices=None):
+    """Return the option letter from an explicit "Answer: $LETTER" line.
+
+    The *_cot prompts instruct the model to end with "Answer: $LETTER", so a
+    long chain-of-thought response that enumerates every option only reveals its
+    final choice on that last line. We honor the *last* such occurrence (the
+    final answer), validating it against ``all_choices`` when the options are
+    known. Returns ``None`` when no explicit answer line is present, so callers
+    can fall back to the general multi-choice parser (e.g. bare-letter answers
+    from the non-CoT prompts, which have no "Answer:" prefix).
+    """
+    matches = _EXPLICIT_ANSWER_RE.findall(pred)
+    for letter in reversed(matches):
+        letter = letter.upper()
+        if all_choices is None or letter in all_choices:
+            return letter
+    return None
+
+
 def mmmu_pro_process_results(doc, results):
     pred = results[0]
-    if "question" in doc and "options" in doc:
+    if "options" in doc:
         index2ans, all_choices = get_multi_choice_info(ast.literal_eval(doc["options"]))
-        parsed_pred = parse_multi_choice_response(pred, all_choices, index2ans)
+        # Prefer the explicit "Answer: $LETTER" line the *_cot prompts require;
+        # this is the single most reliable signal for long reasoning outputs and
+        # is a no-op for bare-letter (non-CoT) answers, which fall through to the
+        # general parser. The vision variant has no "question" field (the prompt
+        # is rendered into the image) but still carries "options", so it now gets
+        # proper choice-aware parsing instead of keeping the raw response.
+        parsed_pred = extract_explicit_answer(pred, all_choices)
+        if parsed_pred is None:
+            parsed_pred = parse_multi_choice_response(pred, all_choices, index2ans)
     else:
-        parsed_pred = pred
+        parsed_pred = extract_explicit_answer(pred) or pred
 
     mmmu_acc = {"id": doc["id"], "subject": doc["subject"], "answer": doc["answer"], "parsed_pred": parsed_pred}
     return {"mmmu_acc": mmmu_acc}
