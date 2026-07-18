@@ -9,8 +9,39 @@ def chartqa_doc_to_text(doc, lmms_eval_specific_kwargs):
     return f"{pre_prompt}{question}{post_prompt}"
 
 
+import re
+
+
+def extract_reasoned_answer(text):
+    """Pull the final short answer out of a reasoning response.
+
+    Gated: for plain short answers (base models) this is a near no-op — it returns
+    the trimmed text unless the response looks like reasoning (has <think>/</think>
+    or is long). Handles \\boxed{}, post-</think> content, 'the answer is X', and a
+    last-number fallback. Matches the probe logic validated in
+    scripts/probe_chartqa_reasoning.py.
+    """
+    t = text.strip()
+    if "<think>" not in t and "</think>" not in t and len(t) <= 30:
+        return t  # base-model style short answer; leave untouched
+    m = re.search(r"\\boxed\{([^}]*)\}", t)
+    if m:
+        return m.group(1).strip()
+    if "</think>" in t:
+        after = t.rsplit("</think>", 1)[1].strip()
+        if after:
+            t = after
+    m = re.search(r"(?:final answer|the answer)(?:\s*is)?\s*[:=]?\s*\**([^\n.]+)", t, re.I)
+    if m:
+        return m.group(1).strip().rstrip(".*")
+    nums = re.findall(r"-?\d[\d,]*\.?\d*%?", t)
+    if nums:
+        return nums[-1].replace(",", "")
+    return t.split("\n")[-1].strip()
+
+
 def chartqa_process_results(doc, results):
-    pred = results[0]
+    pred = extract_reasoned_answer(results[0])
     type = doc["type"]
     score = relaxed_correctness(pred, doc["answer"])
     score = 1.0 if score else 0.0

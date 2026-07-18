@@ -93,6 +93,15 @@ class Qwen2_5_VL(Qwen2_5_VLSimple):
                 else:
                     video_kwargs["nframes"] = self.max_num_frames
             batched_messages = [chat_message.to_hf_messages(video_kwargs=video_kwargs) for chat_message in chat_messages]
+            # The chat path builds messages from the task's doc_to_messages, which carry
+            # no system turn, so apply_chat_template falls back to the template default
+            # ("You are a helpful assistant."). Inject the configured system_prompt (e.g.
+            # the Saliency-R1 reasoning prompt set via LMMS_SYSTEM_PROMPT_FILE in the
+            # inherited __init__) so it actually reaches the model.
+            if getattr(self, "system_prompt", None):
+                for _msgs in batched_messages:
+                    if not (_msgs and isinstance(_msgs[0], dict) and _msgs[0].get("role") == "system"):
+                        _msgs.insert(0, {"role": "system", "content": self.system_prompt})
             texts = self.processor.apply_chat_template(batched_messages, tokenize=False, add_generation_prompt=True)
             image_inputs, video_inputs, video_kwargs_qwen = process_vision_info(
                 batched_messages,
@@ -127,6 +136,7 @@ class Qwen2_5_VL(Qwen2_5_VLSimple):
                 "temperature": 0.0,  # Set to 0 for greedy default
                 "top_p": None,
                 "num_beams": 1,
+                "repetition_penalty": 1.0,
             }
             # Update with provided kwargs
             current_gen_kwargs = {**default_gen_kwargs, **gen_kwargs}
@@ -151,6 +161,7 @@ class Qwen2_5_VL(Qwen2_5_VLSimple):
                 num_beams=current_gen_kwargs["num_beams"],
                 max_new_tokens=current_gen_kwargs["max_new_tokens"],
                 top_k=current_gen_kwargs.get("top_k", None),
+                repetition_penalty=current_gen_kwargs["repetition_penalty"],
                 use_cache=self.use_cache,
             )
             end_time = time.time()

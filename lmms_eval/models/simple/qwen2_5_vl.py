@@ -1,3 +1,4 @@
+import os
 import re
 from typing import List, Optional, Tuple, Union
 
@@ -91,6 +92,18 @@ class Qwen2_5_VL(lmms):
         self.processor = AutoProcessor.from_pretrained(pretrained, max_pixels=max_pixels, min_pixels=min_pixels)
         self._tokenizer = AutoTokenizer.from_pretrained(pretrained)
         self.system_prompt = system_prompt
+        # Allow overriding the system prompt without hitting --model_args comma
+        # parsing (the Saliency-R1 R1-style prompt contains commas). A file path
+        # takes precedence over an inline env var, which takes precedence over
+        # the constructor default.
+        _sys_file = os.environ.get("LMMS_SYSTEM_PROMPT_FILE")
+        if _sys_file:
+            with open(_sys_file) as _f:
+                self.system_prompt = _f.read().strip()
+            eval_logger.info(f"Overriding system_prompt from LMMS_SYSTEM_PROMPT_FILE={_sys_file}")
+        elif os.environ.get("LMMS_SYSTEM_PROMPT"):
+            self.system_prompt = os.environ["LMMS_SYSTEM_PROMPT"]
+            eval_logger.info("Overriding system_prompt from LMMS_SYSTEM_PROMPT env var")
         self.interleave_visuals = interleave_visuals
 
         self._config = self.model.config
@@ -319,6 +332,7 @@ class Qwen2_5_VL(lmms):
                 "temperature": 0.0,  # Set to 0 for greedy default
                 "top_p": None,
                 "num_beams": 1,
+                "repetition_penalty": 1.0,
             }
             # Update with provided kwargs
             current_gen_kwargs = {**default_gen_kwargs, **gen_kwargs}
@@ -340,6 +354,7 @@ class Qwen2_5_VL(lmms):
                 top_p=current_gen_kwargs["top_p"],
                 num_beams=current_gen_kwargs["num_beams"],
                 max_new_tokens=current_gen_kwargs["max_new_tokens"],
+                repetition_penalty=current_gen_kwargs["repetition_penalty"],
                 use_cache=self.use_cache,
             )
 
@@ -531,6 +546,7 @@ class Qwen2_5_VL(lmms):
                     "temperature": 0.0,
                     "top_p": None,
                     "num_beams": 1,
+                    "repetition_penalty": 1.0,
                 }
                 current_gen_kwargs = {**default_gen_kwargs, **gen_kwargs}
                 pad_token_id = self.tokenizer.pad_token_id
@@ -551,6 +567,7 @@ class Qwen2_5_VL(lmms):
                     top_p=current_gen_kwargs["top_p"],
                     num_beams=current_gen_kwargs["num_beams"],
                     max_new_tokens=current_gen_kwargs["max_new_tokens"],
+                    repetition_penalty=current_gen_kwargs["repetition_penalty"],
                     use_cache=self.use_cache,
                 )
 

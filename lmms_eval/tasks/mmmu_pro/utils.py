@@ -118,17 +118,54 @@ def extract_explicit_answer(pred, all_choices=None):
     return None
 
 
+def _extract_reasoned_choice(pred, all_choices):
+    """Extract the final option letter from a <think>...</think> reasoning response.
+
+    Saliency-R1 style outputs put the answer AFTER </think>, often as
+    "the answer is E." / "E." / "\\boxed{E}" rather than the "Answer: $LETTER"
+    line the CoT prompts request. Restrict parsing to the post-</think> segment
+    and prefer explicit answer phrasing, so we don't grab an option letter from
+    the reasoning body (which the general parser does, mis-scoring correct CoT).
+    Returns None (fall through to the standard parsers) when no </think> is
+    present, so non-reasoning/base outputs are unaffected.
+    """
+    if "</think>" not in pred:
+        return None
+    seg = pred.rsplit("</think>", 1)[1].strip()
+    if not seg:
+        return None
+    m = re.search(r"\\boxed\{\s*([A-Z])\b", seg)
+    if m and m.group(1) in all_choices:
+        return m.group(1)
+    ms = re.findall(r"(?:answer|option)(?:\s+is)?\s*[:\-]?\s*\(?([A-Z])\b", seg, re.I)
+    for letter in reversed(ms):
+        if letter.upper() in all_choices:
+            return letter.upper()
+    m = re.match(r"\(?([A-Z])[).:\s]", seg)
+    if m and m.group(1) in all_choices:
+        return m.group(1)
+    # bare single-letter answer, e.g. "</think>\nE"
+    stripped = seg.strip("()*.\n ")
+    if len(stripped) == 1 and stripped.upper() in all_choices:
+        return stripped.upper()
+    return None
+
+
 def mmmu_pro_process_results(doc, results):
     pred = results[0]
     if "options" in doc:
         index2ans, all_choices = get_multi_choice_info(ast.literal_eval(doc["options"]))
-        # Prefer the explicit "Answer: $LETTER" line the *_cot prompts require;
+        # For reasoning models, take the answer from AFTER </think> first (the
+        # general parser otherwise grabs a stray option letter from the CoT body).
+        parsed_pred = _extract_reasoned_choice(pred, all_choices)
+        # Then the explicit "Answer: $LETTER" line the *_cot prompts require;
         # this is the single most reliable signal for long reasoning outputs and
         # is a no-op for bare-letter (non-CoT) answers, which fall through to the
         # general parser. The vision variant has no "question" field (the prompt
         # is rendered into the image) but still carries "options", so it now gets
         # proper choice-aware parsing instead of keeping the raw response.
-        parsed_pred = extract_explicit_answer(pred, all_choices)
+        if parsed_pred is None:
+            parsed_pred = extract_explicit_answer(pred, all_choices)
         if parsed_pred is None:
             parsed_pred = parse_multi_choice_response(pred, all_choices, index2ans)
     else:
