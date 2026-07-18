@@ -332,7 +332,6 @@ class Qwen2_5_VL(lmms):
                 "temperature": 0.0,  # Set to 0 for greedy default
                 "top_p": None,
                 "num_beams": 1,
-                "repetition_penalty": 1.0,
             }
             # Update with provided kwargs
             current_gen_kwargs = {**default_gen_kwargs, **gen_kwargs}
@@ -354,7 +353,6 @@ class Qwen2_5_VL(lmms):
                 top_p=current_gen_kwargs["top_p"],
                 num_beams=current_gen_kwargs["num_beams"],
                 max_new_tokens=current_gen_kwargs["max_new_tokens"],
-                repetition_penalty=current_gen_kwargs["repetition_penalty"],
                 use_cache=self.use_cache,
             )
 
@@ -546,7 +544,6 @@ class Qwen2_5_VL(lmms):
                     "temperature": 0.0,
                     "top_p": None,
                     "num_beams": 1,
-                    "repetition_penalty": 1.0,
                 }
                 current_gen_kwargs = {**default_gen_kwargs, **gen_kwargs}
                 pad_token_id = self.tokenizer.pad_token_id
@@ -567,7 +564,6 @@ class Qwen2_5_VL(lmms):
                     top_p=current_gen_kwargs["top_p"],
                     num_beams=current_gen_kwargs["num_beams"],
                     max_new_tokens=current_gen_kwargs["max_new_tokens"],
-                    repetition_penalty=current_gen_kwargs["repetition_penalty"],
                     use_cache=self.use_cache,
                 )
 
