@@ -4,6 +4,30 @@ import re
 from lmms_eval.filters.extraction import ExtendedRegexFilter
 
 
+def _extract_choice_letter(resp):
+    """Extract the MCQ option letter from a (possibly <think>-reasoned) response.
+
+    IllusionVQA asks for a bare letter, but reasoning models emit
+    '<think>...</think> B.', so the original ^\\s*([A-Z])\\. anchor on the full
+    response fails. Parse the answer after </think>. Returns None to fall back to
+    the raw response (non-reasoning outputs are handled by the same patterns).
+    """
+    seg = resp.rsplit("</think>", 1)[1].strip() if "</think>" in resp else resp.strip()
+    m = re.search(r"\\boxed\{\s*([A-Z])\b", seg)
+    if m:
+        return m.group(1).upper()
+    m = re.search(r"(?:answer|option)(?:\s+(?:is|should be))?\s*[:\-]?\s*\(?([A-Z])\b", seg, re.IGNORECASE)
+    if m:
+        return m.group(1).upper()
+    m = re.match(r"\(?([A-Za-z])[).:\s]", seg)
+    if m:
+        return m.group(1).upper()
+    stripped = seg.strip("()*.\n ")
+    if len(stripped) == 1 and stripped.isalpha():
+        return stripped.upper()
+    return None
+
+
 def illusionvqa_doc_to_text(doc, lmms_eval_specific_kwargs=None):
     question, choices = doc["question"], doc["options"]
     len_choices = len(choices)
@@ -43,20 +67,12 @@ class MultiChoiceRegexFilter(ExtendedRegexFilter):
         filtered_resps = []
 
         for r, doc in zip(resps, docs):
-            # Regex to directly extract the option letter from the model response
-            option_letter_regex = re.compile(r"^\s*([A-Z])\.")
-
-            # Process each response
+            # Process each response. Parse the option letter from the answer
+            # (after </think> for reasoning models); fall back to the raw response.
             filtered = []
             for resp in r:
-                # Try to match the option letter at the start of the response
-                match = option_letter_regex.match(resp)
-                if match:
-                    # If a match is found, append the matched letter
-                    filtered.append(match.group(1))
-                else:
-                    # If no match, return the original response
-                    filtered.append(resp)
+                letter = _extract_choice_letter(resp)
+                filtered.append(letter if letter is not None else resp)
 
             # Assuming we need the first response that matches or the original response
             filtered_resps.append(filtered[0])

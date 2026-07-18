@@ -1,4 +1,20 @@
 # Add the following functions to your existing utils.py file
+import re
+
+
+def _extract_yes_no(pred):
+    """Reduce a response to a bare 'yes'/'no' label.
+
+    POPE scores by exact match (pred == 'yes'/'no'), which fails for reasoning
+    models that emit '<think>...</think> Yes.' or verbose 'Yes, there is ...'.
+    Take the answer after </think> (if present) and return the first yes/no
+    token. Falls back to the stripped text so non-yes/no outputs are unchanged.
+    """
+    if "</think>" in pred:
+        pred = pred.rsplit("</think>", 1)[1]
+    pred = pred.lower().strip()
+    m = re.search(r"\b(yes|no)\b", pred)
+    return m.group(1) if m else pred
 
 
 def pope_doc_to_visual(doc):
@@ -15,7 +31,7 @@ def pope_doc_to_text(doc, lmms_eval_specific_kwargs):
 
 
 def pope_process_results(doc, results):
-    pred = results[0].lower().strip()
+    pred = _extract_yes_no(results[0])
     gt_ans = doc["answer"].lower().strip()
     assert gt_ans in ["yes", "no"]
     score = 1.0 if pred == gt_ans else 0.0
