@@ -1,3 +1,4 @@
+import os
 import re
 from concurrent.futures import ThreadPoolExecutor
 from typing import List, Optional, Tuple, Union
@@ -130,6 +131,18 @@ class Qwen3_VL(lmms):
         self.processor = AutoProcessor.from_pretrained(pretrained, max_pixels=max_pixels, min_pixels=min_pixels)
         self._tokenizer = AutoTokenizer.from_pretrained(pretrained)
         self.system_prompt = system_prompt
+        # Allow overriding the system prompt without hitting --model_args comma
+        # parsing (the Saliency-R1 R1-style prompt contains commas). A file path
+        # takes precedence over an inline env var, then the constructor default.
+        # (chat/qwen3_vl.py inserts self.system_prompt as the system turn.)
+        _sys_file = os.environ.get("LMMS_SYSTEM_PROMPT_FILE")
+        if _sys_file:
+            with open(_sys_file) as _f:
+                self.system_prompt = _f.read().strip()
+            eval_logger.info(f"Overriding system_prompt from LMMS_SYSTEM_PROMPT_FILE={_sys_file}")
+        elif os.environ.get("LMMS_SYSTEM_PROMPT"):
+            self.system_prompt = os.environ["LMMS_SYSTEM_PROMPT"]
+            eval_logger.info("Overriding system_prompt from LMMS_SYSTEM_PROMPT env var")
         self.interleave_visuals = interleave_visuals
 
         self._config = self.model.config
@@ -251,7 +264,7 @@ class Qwen3_VL(lmms):
             "use_cache": self.use_cache,
             "do_sample": current["do_sample"],
         }
-        for key in ("temperature", "top_p", "top_k", "num_beams"):
+        for key in ("temperature", "top_p", "top_k", "num_beams", "repetition_penalty"):
             val = current.get(key)
             if val is not None:
                 generate_kwargs[key] = val
