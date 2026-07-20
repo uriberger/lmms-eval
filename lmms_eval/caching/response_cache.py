@@ -437,6 +437,8 @@ class ResponseCache:
         task_dict: Optional[dict] = None,
         world_size: int = 1,
         global_rank: int = 0,
+        dist_backend: str = "accelerate",
+        accelerator: Any = None,
     ) -> "ResponseCache":
         from lmms_eval.utils import (
             get_lmms_eval_cache_version,
@@ -498,8 +500,22 @@ class ResponseCache:
 
         # Recover data from any runs that were killed before finalize() ran.
         # Those runs have rank_*.db files with committed data but no .merged marker.
+        # Only rank 0 rebuilds cache.db (the shared read-only DB every rank reads on
+        # startup). The try/except guarantees rank 0 still reaches the barrier below
+        # even if recovery throws, so the other ranks never deadlock waiting for it.
         if global_rank == 0:
-            _recover_killed_runs(cache_root, target_db, run_dir)
+            try:
+                _recover_killed_runs(cache_root, target_db, run_dir)
+            except Exception as exc:
+                eval_logger.warning(f"ResponseCache: killed-run recovery failed: {exc}")
+
+        # Barrier: non-zero ranks must wait for rank 0 to finish (re)building cache.db
+        # before they decide whether to open it as the shared read-only DB. Without
+        # this, ranks 1..N race ahead, find no cache.db yet, get shared_db=None, and
+        # re-run their entire shard on the first restart after a kill — which looks
+        # like the run "starting from 0" even though the cache is intact.
+        if world_size > 1:
+            cls._distributed_barrier(dist_backend, accelerator)
 
         shared_db_path = target_db if os.path.exists(target_db) else None
 
@@ -1099,15 +1115,21 @@ class ResponseCache:
 
     @staticmethod
     def _distributed_barrier(dist_backend: str, accelerator: Any) -> None:
-        """Execute a distributed barrier."""
+        """Execute a distributed barrier.
+
+        Prefers the accelerate handle when available; otherwise falls back to a
+        raw ``torch.distributed`` barrier if the process group is initialized (so
+        the barrier still fires under torchrun, or when the accelerator handle was
+        not threaded through). A no-op when neither is available.
+        """
         try:
             if dist_backend == "accelerate" and accelerator is not None:
                 accelerator.wait_for_everyone()
-            elif dist_backend == "torchrun":
-                import torch.distributed as dist
+                return
+            import torch.distributed as dist
 
-                if dist.is_initialized():
-                    dist.barrier()
+            if dist.is_initialized():
+                dist.barrier()
         except Exception as e:
             eval_logger.warning(f"ResponseCache: barrier failed: {e}")
 

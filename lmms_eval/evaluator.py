@@ -516,6 +516,8 @@ def simple_evaluate(
             task_dict=task_dict,
             world_size=world_size,
             global_rank=global_rank,
+            dist_backend=distributed_executor_backend,
+            accelerator=getattr(lm, "accelerator", None),
         )
 
     eval_succeeded = False
