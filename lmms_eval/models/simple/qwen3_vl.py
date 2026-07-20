@@ -281,7 +281,7 @@ class Qwen3_VL(lmms):
     def _preprocess_chunk(self, chunk):
         """Preprocess a batch chunk on CPU: message building, video decoding, tokenization.
 
-        Returns (inputs, contexts, gen_kwargs, until) with inputs still on CPU.
+        Returns (inputs, contexts, gen_kwargs, until, doc_id, task, split) with inputs still on CPU.
         """
         contexts, all_gen_kwargs, doc_to_visual, doc_id, task, split = zip(*chunk)
         visual_list = [doc_to_visual[0](self.task_dict[t][s][i]) for t, s, i in zip(task, split, doc_id)]
@@ -400,7 +400,7 @@ class Qwen3_VL(lmms):
                 return_tensors="pt",
             )
 
-        return inputs, contexts, gen_kwargs, until
+        return inputs, contexts, gen_kwargs, until, doc_id, task, split
 
     def generate_until(self, requests: List[Instance]) -> List[str]:
         res = []
@@ -417,7 +417,7 @@ class Qwen3_VL(lmms):
             future = executor.submit(self._preprocess_chunk, chunks[0]) if chunks else None
 
             for idx in range(len(chunks)):
-                inputs, contexts, gen_kwargs, until = future.result()
+                inputs, contexts, gen_kwargs, until, doc_id, task, split = future.result()
 
                 if idx + 1 < len(chunks):
                     future = executor.submit(self._preprocess_chunk, chunks[idx + 1])
@@ -442,10 +442,14 @@ class Qwen3_VL(lmms):
                             ans = ans.split(term)[0]
                     answers[i] = ans
 
-                for ans, context in zip(answers, contexts):
+                for i, (ans, context) in enumerate(zip(answers, contexts)):
                     ans = self._strip_thinking(ans)
                     res.append(ans)
-                    self.cache_hook.add_partial("generate_until", (context, gen_kwargs), ans)
+                    # Third tuple element identifies the sample exactly so ResponseCache
+                    # matches on (task, doc_id) instead of text equality (context is
+                    # mutated here — <image> stripped, reasoning_prompt appended — so it
+                    # no longer equals the raw Instance.args[0] the cache indexes by).
+                    self.cache_hook.add_partial("generate_until", (context, gen_kwargs, {"task": task[i], "split": split[i], "doc_id": doc_id[i]}), ans)
                     pbar.update(1)
 
         res = re_ords.get_original(res)

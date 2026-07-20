@@ -123,7 +123,10 @@ class Qwen3_VL(Qwen3_VLSimple):
             for i, (ans, context) in enumerate(zip(answers, texts)):
                 ans = self._strip_thinking(ans)
                 res.append(GenerationResult(text=ans, token_counts=TokenCounts(output_tokens=len(generated_ids_trimmed[i]))))
-                self.cache_hook.add_partial("generate_until", (context, gen_kwargs), ans)
+                # Third tuple element identifies the sample exactly so ResponseCache
+                # can match it without relying on text equality (context here is the
+                # chat-template output, not the raw Instance.args[0]).
+                self.cache_hook.add_partial("generate_until", (context, gen_kwargs, {"task": task[i], "split": split[i], "doc_id": doc_id[i]}), ans)
 
                 eval_logger.debug(f"Question: {context}")
                 eval_logger.debug(f"Model Response: {ans}")
