@@ -1,0 +1,2 @@
+task: "algopuzzlevqa"
+include: _algopuzzlevqa_default
