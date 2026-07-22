@@ -2,6 +2,18 @@
 P3_CATEGORIES = ["orientation", "color", "size"]
 O3_CATEGORIES = ["orientation", "color", "focus", "shape", "size", "location", "pattern"]
 
+# Characters stripped from the surrounding of each predicted token before matching.
+# Models fine-tuned to answer in natural language emit e.g. "Size." / "Color." /
+# "'orientation'", which are semantically correct but fail the exact-set match against
+# the bare lowercase labels ("size", "color", "orientation"). Stripping surrounding
+# whitespace/punctuation makes scoring robust to answer formatting without changing
+# what counts as a correct feature.
+_STRIP_CHARS = " \t\n\r.!?;:'\"`*()[]{}"
+
+
+def _normalize_pred_token(token):
+    return token.strip().strip(_STRIP_CHARS).strip()
+
 
 def p3o3_doc_to_visual(doc):
     # Assuming the 'doc' dictionary has a key 'image' with image data
@@ -29,8 +41,9 @@ def p3o3_doc_to_text(doc, prompt_kwargs=None):
 
 
 def process_results(doc, results, categories):
-    pred = {x.strip() for x in results[0].lower().strip("[").strip("]").split(",")}
-    gt_ans = {x.strip() for x in doc["answer"].lower().split(",")}
+    pred = {_normalize_pred_token(x) for x in results[0].lower().strip("[").strip("]").split(",")}
+    pred.discard("")
+    gt_ans = {_normalize_pred_token(x) for x in doc["answer"].lower().split(",")}
 
     exact_match = int(pred == gt_ans)
     matches = pred.intersection(gt_ans)
