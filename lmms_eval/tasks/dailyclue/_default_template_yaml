@@ -1,0 +1,33 @@
+dataset_path: /home/uberger/scratch/cache/hf_cache/dailyclue_hf
+dataset_kwargs:
+  load_from_disk: true
+test_split: train
+output_type: generate_until
+doc_to_visual: !function utils.dailyclue_doc_to_visual
+doc_to_text: !function utils.dailyclue_doc_to_text
+doc_to_target: "ground_truth"
+process_results: !function utils.dailyclue_process_results
+# matches official infer/inference.py (temperature 0.1, max_tokens 10240); the
+# large cap prevents truncating mode-C reasoning before the <answer> tag.
+generation_kwargs:
+  max_new_tokens: 10240
+  temperature: 0.1
+  do_sample: true
+metric_list:
+  - metric: dailyclue_overall
+    aggregation: !function utils.dailyclue_aggregate_overall
+    higher_is_better: true
+  - metric: daily_commonsense
+    aggregation: !function utils.dailyclue_aggregate
+    higher_is_better: true
+  - metric: location
+    aggregation: !function utils.dailyclue_aggregate
+    higher_is_better: true
+  - metric: spatial
+    aggregation: !function utils.dailyclue_aggregate
+    higher_is_better: true
+  - metric: science
+    aggregation: !function utils.dailyclue_aggregate
+    higher_is_better: true
+metadata:
+  - version: 0.0

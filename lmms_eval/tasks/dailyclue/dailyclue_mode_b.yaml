@@ -1,0 +1,5 @@
+include: _default_template_yaml
+task: "dailyclue_mode_b"
+lmms_eval_specific_kwargs:
+  default:
+    mode: "b"
