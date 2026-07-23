@@ -16,14 +16,23 @@ except ImportError as e:
 
 NUM_SECONDS_TO_SLEEP = 5
 
-# Initialize the judge server
+# Judge server config. The server itself is created lazily (see _get_server)
+# so that rule-based tasks (e.g. mathvision_testmini) don't require API
+# credentials just to import this module.
 API_TYPE = os.getenv("API_TYPE", "openai")
 GPT_MODEL = os.getenv("MODEL_VERSION", "gpt-4o-2024-11-20")
 
-server_config = ServerConfig(
-    model_name=GPT_MODEL,
-)
-server = get_server(server_name=API_TYPE, config=server_config)
+_server = None
+
+
+def _get_server():
+    global _server
+    if _server is None:
+        server_config = ServerConfig(
+            model_name=GPT_MODEL,
+        )
+        _server = get_server(server_name=API_TYPE, config=server_config)
+    return _server
 
 
 def mathvision_doc_to_visual(doc):
@@ -57,7 +66,7 @@ def mathvision_gpt_eval_process_results(doc, results):
 
         try:
             # Use the llm_judge API for binary evaluation
-            result = server.evaluate_binary(question=question, answer=gt_answer, prediction=model_answer, output_format="0/1")
+            result = _get_server().evaluate_binary(question=question, answer=gt_answer, prediction=model_answer, output_format="0/1")
 
             # Parse the result
             if result["success"]:
