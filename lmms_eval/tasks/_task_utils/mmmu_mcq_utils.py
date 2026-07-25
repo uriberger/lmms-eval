@@ -1,7 +1,14 @@
-import random
 import re
 
 import numpy as np
+
+# Returned when no choice can be parsed out of a response. Upstream MMMU used
+# random.choice(all_choices) here, which (a) made runs non-reproducible and
+# (b) graded a parse failure at ~1/n_choices instead of 0, so a model whose
+# output format the parser does not understand still scores at chance. "" is
+# never a valid choice letter, so it compares unequal to every gold answer --
+# and it is already the sentinel mmmu/utils.py uses for open-ended non-answers.
+NO_ANSWER = ""
 
 
 def get_multi_choice_info(options, start_chr="A"):
@@ -45,7 +52,7 @@ def parse_mmmu_multi_choice_response(response, all_choices, index2ans):
                 index_ans = False
 
     if len(candidates) == 0:
-        pred_index = random.choice(all_choices)
+        pred_index = NO_ANSWER
     elif len(candidates) > 1:
         start_indexes = []
         if index_ans:
@@ -103,7 +110,7 @@ def parse_jmmmu_multi_choice_response(response, all_choices, index2ans):
                 index_ans = False
 
     if len(candidates) == 0:
-        pred_index = random.choice(all_choices)
+        pred_index = NO_ANSWER
     elif len(candidates) > 1:
         start_indexes = []
         if index_ans:
