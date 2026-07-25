@@ -1,6 +1,5 @@
 import json
 import os
-import re
 from collections import defaultdict
 from pathlib import Path
 from typing import Any, Dict, List
@@ -13,6 +12,7 @@ from PIL import Image
 
 from lmms_eval.llm_judge import get_server
 from lmms_eval.llm_judge.protocol import ServerConfig
+from lmms_eval.tasks.omnispatial.answer_parsing import extract_answer_letter
 
 with open(Path(__file__).parent / "_default_template_yaml", "r") as f:
     raw_data = f.readlines()
@@ -69,16 +69,21 @@ def omnispatial_process_results(doc: Dict, results: List[str]) -> Dict[str, Dict
 
     # extract predicted answer
     eval_type = config["metadata"]["eval_type"]
+    pred_letter = None
     if eval_type == "json":
         try:
             cleaned = response.strip().removeprefix("```json").removesuffix("```").strip()
-            pred_letter = json.loads(cleaned).get("answer", "A").strip().upper()[:1]
+            pred_letter = json.loads(cleaned).get("answer", "").strip().upper()[:1] or None
         except Exception:
-            pred_letter = "A"
+            # Unparseable output scores incorrect. Defaulting to a letter here
+            # would grade a format failure at that letter's gold base rate.
+            pred_letter = None
         flag = pred_letter == grounded_output
     elif eval_type == "re":
-        PATTERN = re.compile(r"Answer\s*:\s*([A-D])\b", re.IGNORECASE)
-        pred_letter = PATTERN.findall(response)[-1] if len(PATTERN.findall(response)) > 0 else "A"
+        # Tiered: "Answer: X" first, then a bare letter, then the last option
+        # letter mentioned. None (nothing found) scores incorrect -- see
+        # answer_parsing.extract_answer_letter.
+        pred_letter = extract_answer_letter(response)
         flag = pred_letter == grounded_output
     elif eval_type == "direct":
         pred_letter = response.strip().upper()[:1]
@@ -110,7 +115,9 @@ def omnispatial_process_results(doc: Dict, results: List[str]) -> Dict[str, Dict
         assert False, f"Unknown eval_type: {eval_type}"
     category = "omnispatial_" + doc["sub_task_type"].lower()
     key_benchmark = "omnispatial"
-    omnispatial_submission = {"id": doc["id"], "query": query, "gt_content": grounded_output, "pred": response, "task": doc["task_type"], "sub_task": category, "is_correct": flag}
+    # "pred" keeps the raw response so runs stay re-scorable offline;
+    # "pred_letter" is what was actually graded (None = no answer found).
+    omnispatial_submission = {"id": doc["id"], "query": query, "gt_content": grounded_output, "pred": response, "pred_letter": pred_letter, "task": doc["task_type"], "sub_task": category, "is_correct": flag}
     return {category: omnispatial_submission, key_benchmark: omnispatial_submission}
 
 
