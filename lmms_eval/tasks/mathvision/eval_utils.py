@@ -3,7 +3,14 @@ import re
 import time  # 引入time模块
 from math import *
 
-from latex2sympy2 import latex2sympy
+try:
+    from latex2sympy2 import latex2sympy
+except ImportError:
+    # latex2sympy2 1.9.1 ships a flat top-level module that uses relative
+    # imports, so it cannot be imported at all, and it pins antlr4 4.7.2 which
+    # conflicts with the 4.13.2 that latex2sympy2_extended needs. The extended
+    # fork exposes the same latex2sympy entry point and works with either.
+    from latex2sympy2_extended import latex2sympy
 from tqdm import tqdm
 
 

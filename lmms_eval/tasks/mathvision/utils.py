@@ -11,8 +11,15 @@ try:
         is_number,
     )
 except ImportError as e:
+    # Stay importable so one broken dependency doesn't take down every other
+    # task in the registry, but fail loudly at scoring time instead of raising
+    # a bare NameError hours into a run.
     eval_logger.warning(f"Error importing eval_utils from lmms_eval.tasks.mathvision.eval_utils: {e}")
-    pass
+
+    def _missing_eval_utils(*args, _error=e, **kwargs):
+        raise ImportError(f"mathvision rule-based scoring needs lmms_eval.tasks.mathvision.eval_utils, which failed to import: {_error}")
+
+    find_math_answer = is_equal = is_number = _missing_eval_utils
 
 NUM_SECONDS_TO_SLEEP = 5
 
