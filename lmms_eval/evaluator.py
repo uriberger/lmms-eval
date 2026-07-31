@@ -1121,6 +1121,31 @@ def evaluate(
 
     ### Postprocess outputs ###
     # TODO: del model here, maybe (idea: allow user to specify device of e.g. reward model separately)
+
+    # When a task opts in via `auto_strip_thinking`, prepend a StripThinkingFilter to
+    # the FRONT of each existing filter ensemble's chain so answer-extraction filters
+    # (take_first / regex / multi_choice_regex) receive text with the <think>/<thinking>
+    # reasoning blocks already removed. We deliberately do NOT add a sibling ensemble:
+    # FilterEnsembles do not chain (each reads raw inst.resps and writes its own
+    # filtered_resps key), so a sibling would leave extraction filters seeing un-stripped
+    # text and would create a new scored key holding an unselected list.
+    from lmms_eval.filters.transformation import StripThinkingFilter
+
+    for task_output in eval_tasks:
+        task = task_output.task
+        if not hasattr(task, "_filters"):
+            continue
+        if not getattr(getattr(task, "config", None), "auto_strip_thinking", False):
+            continue
+        # Skip when reasoning_tags is already configured (task or CLI): the scoring loop
+        # below strips those blocks, so auto-stripping here would double-strip.
+        cli_reasoning_tags = getattr(cli_args, "reasoning_tags", None) if cli_args else None
+        task_reasoning_tags = getattr(task.config, "reasoning_tags", None)
+        if parse_reasoning_tags_config(cli_value=cli_reasoning_tags, task_value=task_reasoning_tags) is not None:
+            continue
+        for ensemble in task._filters:
+            ensemble.filters.insert(0, StripThinkingFilter())
+
     for task_output in eval_tasks:
         task = task_output.task
         task.apply_filters()
