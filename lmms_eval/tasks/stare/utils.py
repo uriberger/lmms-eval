@@ -5,7 +5,12 @@ from collections import defaultdict
 from pathlib import Path
 
 import yaml
-from latex2sympy2 import latex2sympy
+try:
+    from latex2sympy2 import latex2sympy
+except ImportError:
+    # See the note in tasks/mathvision/eval_utils.py: latex2sympy2 1.9.1 is
+    # unimportable and antlr-incompatible; the extended fork is a drop-in.
+    from latex2sympy2_extended import latex2sympy
 from sympy import simplify
 from word2number import w2n
 
