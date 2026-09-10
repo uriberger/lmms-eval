@@ -20,6 +20,7 @@ from lmms_eval.api.instance import Instance
 from lmms_eval.api.model import lmms
 from lmms_eval.api.registry import register_model
 from lmms_eval.imports import optional_import
+from lmms_eval.models.prompt_utils import strip_answer_format_instructions
 from lmms_eval.models.model_utils.media_encoder import encode_image_to_data_url
 
 process_vision_info, _has_qwen_vl = optional_import("qwen_vl_utils", "process_vision_info")
@@ -232,6 +233,9 @@ class Qwen2_5_VL(lmms):
             for i in range(len(contexts)):
                 if "<image>" in contexts[i]:
                     contexts[i] = contexts[i].replace("<image>", "")
+                # Opt-in, and applied here because only the rendered prompt has
+                # every copy of the instruction -- see prompt_utils.
+                contexts[i] = strip_answer_format_instructions(contexts[i], task)
 
             batched_messages = []
             for i, context in enumerate(contexts):

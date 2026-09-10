@@ -15,6 +15,7 @@ from lmms_eval.api.instance import Instance
 from lmms_eval.api.model import lmms
 from lmms_eval.api.registry import register_model
 from lmms_eval.imports import optional_import
+from lmms_eval.models.prompt_utils import strip_answer_format_instructions
 
 process_vision_info, _has_qwen_vl = optional_import("qwen_vl_utils", "process_vision_info")
 if not _has_qwen_vl:
@@ -300,6 +301,10 @@ class Qwen3_VL(lmms):
         for i in range(len(contexts)):
             if "<image>" in contexts[i]:
                 contexts[i] = contexts[i].replace("<image>", "")
+            # Opt-in, and applied here because only the rendered prompt has every
+            # copy of the instruction -- see prompt_utils for why the task config
+            # is not enough.
+            contexts[i] = strip_answer_format_instructions(contexts[i], task[i])
 
         video_kwargs = self._build_video_kwargs()
 
