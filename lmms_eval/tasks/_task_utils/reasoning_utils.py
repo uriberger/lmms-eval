@@ -161,6 +161,19 @@ def extract_anwser_tag(predict_str: str) -> str:
             if number_match:
                 return number_match.group(1)
 
+    # Nothing matched, and returning "" scores the item 0 however right it was.
+    # That is not hypothetical: a model answering multiple choice with a bare
+    # "A" carries no tag and no digit, so LogicVista scored 0.45% instead of
+    # 56.0% -- every one of its 448 answers discarded before it was compared to
+    # anything. The last non-empty line is the answer in that format, and is the
+    # answer for an untagged reasoning chain too. Deliberately the last LINE and
+    # not the whole string: handing a full chain to relax_exact_match lets
+    # parse_mcq pick an option letter out of the reasoning, which is how
+    # vstar_bench used to score the wrong choice.
+    for line in reversed(lines):
+        if line.strip():
+            return line.strip()
+
     return ""
 
 
