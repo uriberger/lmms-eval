@@ -43,13 +43,22 @@ def compute_final_scores(metrics, total_count):
         "RoteMemorization_loose": len(metrics["steps2_filtered_rows_1_loose"]) + len(metrics["steps3_filtered_rows_1_loose"]),
         "RoteMemorization_strict": len(metrics["steps2_filtered_rows_1_strict"]) + len(metrics["steps3_filtered_rows_1_strict"]),
     }
+    # Rote memorization is a share of the multi-step questions answered
+    # correctly, so the denominator is zero when the model got none of them --
+    # which in practice means the answer parser returned nothing, not that the
+    # model failed. Report 0.00% and let the score speak; a ZeroDivisionError
+    # here kills the whole lmms_eval invocation and takes every other task's
+    # results down with it.
+    def _rate(numerator, denominator):
+        return "{:.2%}".format(numerator / denominator) if denominator else "0.00%"
+
     rates = {
-        "InadequateGeneralization_rate": "{:.2%}".format(total_counts["InadequateGeneralization"] / total_count),
-        "InsufficientKnowledge_rate": "{:.2%}".format(total_counts["InsufficientKnowledge"] / total_count),
-        "CompleteMastery_loose_rate": "{:.2%}".format(total_counts["CompleteMastery_loose"] / total_count),
-        "CompleteMastery_strict_rate": "{:.2%}".format(total_counts["CompleteMastery_strict"] / total_count),
-        "RoteMemorization_loose_rate": "{:.2%}".format(total_counts["RoteMemorization_loose"] / (total_counts["CompleteMastery_loose"] + total_counts["RoteMemorization_loose"])),
-        "RoteMemorization_strict_rate": "{:.2%}".format(total_counts["RoteMemorization_strict"] / (total_counts["CompleteMastery_strict"] + total_counts["RoteMemorization_strict"])),
+        "InadequateGeneralization_rate": _rate(total_counts["InadequateGeneralization"], total_count),
+        "InsufficientKnowledge_rate": _rate(total_counts["InsufficientKnowledge"], total_count),
+        "CompleteMastery_loose_rate": _rate(total_counts["CompleteMastery_loose"], total_count),
+        "CompleteMastery_strict_rate": _rate(total_counts["CompleteMastery_strict"], total_count),
+        "RoteMemorization_loose_rate": _rate(total_counts["RoteMemorization_loose"], total_counts["CompleteMastery_loose"] + total_counts["RoteMemorization_loose"]),
+        "RoteMemorization_strict_rate": _rate(total_counts["RoteMemorization_strict"], total_counts["CompleteMastery_strict"] + total_counts["RoteMemorization_strict"]),
     }
     return total_counts, rates
 
