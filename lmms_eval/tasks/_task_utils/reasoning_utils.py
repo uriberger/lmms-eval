@@ -119,7 +119,7 @@ def extract_boxed_answer(predict_str: str) -> str:
 def extract_anwser_tag(predict_str: str) -> str:
     """Extract the answer tag from the prediction string.
 
-    This function now handles both <answer> tags and \boxed{} format.
+    Handles <answer> tags, \boxed{} format, and a plain answer after </think>.
 
     Args:
         predict_str (str): The prediction string containing the answer tag.
@@ -137,6 +137,18 @@ def extract_anwser_tag(predict_str: str) -> str:
     boxed_answer = extract_boxed_answer(predict_str)
     if boxed_answer:
         return boxed_answer
+
+    # Neither tag is present when the model was given a <think>...</think>
+    # system prompt rather than this module's <answer> one -- and then the two
+    # fallbacks below are the wrong tool: the numeric scan finds nothing in a
+    # multiple-choice answer, so a correct "C" extracted to "" and scored 0.
+    # The segment after the last </think> IS the answer in that format, so hand
+    # it back whole; relax_exact_match already parses an option letter out of a
+    # string when the ground truth is one.
+    if "</think>" in predict_str:
+        after_think = predict_str.rsplit("</think>", 1)[1].strip()
+        if after_think:
+            return after_think
 
     # If neither format found, try to extract the last number or expression
     # This is a fallback for cases where the answer is just stated without formatting
