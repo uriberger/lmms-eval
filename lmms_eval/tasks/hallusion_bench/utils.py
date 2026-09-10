@@ -7,6 +7,10 @@ import requests
 from tqdm import tqdm
 
 API_TYPE = os.getenv("API_TYPE", "openai")
+# Same knob every other GPT-judged task here reads. Gateways that are not
+# api.openai.com namespace their models (e.g. azure/openai/gpt-4o-mini) and
+# reject a bare "gpt-4" with 403, which this file used to hard-code.
+GPT_EVAL_MODEL_NAME = os.getenv("MODEL_VERSION", "gpt-4")
 
 if API_TYPE == "openai":
     API_URL = os.getenv("OPENAI_API_URL", "https://api.openai.com/v1/chat/completions")
@@ -26,7 +30,7 @@ elif API_TYPE == "azure":
 from loguru import logger as eval_logger
 
 
-def evaluate_by_chatgpt(data, output_entry, correctness_entry, gpt_model="gpt-4", load_json=False, save_json_path="./hallusion_output.json", retries=3):
+def evaluate_by_chatgpt(data, output_entry, correctness_entry, gpt_model=GPT_EVAL_MODEL_NAME, load_json=False, save_json_path="./hallusion_output.json", retries=3):
     if load_json and os.path.exists(save_json_path):
         with open(save_json_path, "r") as f:
             output = json.load(f)
@@ -43,6 +47,7 @@ def evaluate_by_chatgpt(data, output_entry, correctness_entry, gpt_model="gpt-4"
         prompt += "\nOutput:"
 
         # https://github.com/openai/openai-python/issues/322#issuecomment-1767841683
+        response = None
         for attempt in range(retries):
             try:
                 messages = [{"role": "user", "content": prompt}]
@@ -63,6 +68,14 @@ def evaluate_by_chatgpt(data, output_entry, correctness_entry, gpt_model="gpt-4"
                     time.sleep(5)
                 else:  # If this was the last attempt, log and return empty
                     eval_logger.error(f"All {retries} attempts failed. Last error message: {str(e)}")
+        if response is None:
+            # Falling through to the "unclear" fallback below would score the sample
+            # without ever asking the judge, and save_json_path is reloaded verbatim
+            # on the next run (load_json=True) -- so an API outage would be baked into
+            # the score permanently, with only an INFO line to show for it. Stop here
+            # instead: every sample judged so far is already on disk, and a rerun
+            # picks up from that point.
+            raise RuntimeError(f"HallusionBench GPT judging failed after {retries} attempts against {API_URL} with model '{gpt_model}'. See the errors above; set MODEL_VERSION to a model this endpoint serves.")
         try:
             output_text = response["choices"][0]["message"]["content"]
         except Exception as e:
@@ -88,7 +101,7 @@ def evaluate_by_chatgpt(data, output_entry, correctness_entry, gpt_model="gpt-4"
     return output
 
 
-def check_same_by_chatgpt(data, output_entry, gpt_model="gpt-4", load_json=False, save_json_path="./hallusion_output.json", retries=3):
+def check_same_by_chatgpt(data, output_entry, gpt_model=GPT_EVAL_MODEL_NAME, load_json=False, save_json_path="./hallusion_output.json", retries=3):
     orig_response = {}
 
     for r in data:
@@ -112,11 +125,9 @@ def check_same_by_chatgpt(data, output_entry, gpt_model="gpt-4", load_json=False
             # https://github.com/openai/openai-python/issues/322#issuecomment-1767841683
             for attempt in range(retries):
                 try:
-                    headers = {
-                        "api-key": API_KEY,
-                        "Content-Type": "application/json",
-                    }
-
+                    # The module-level headers, not a hard-coded azure-style "api-key":
+                    # this path is currently unused (evaluate_hb.py has both call sites
+                    # commented out), and would 403 the moment it was switched back on.
                     messages = [{"role": "user", "content": prompt}]
 
                     payload = {
