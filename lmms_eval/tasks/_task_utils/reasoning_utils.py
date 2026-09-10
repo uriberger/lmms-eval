@@ -67,6 +67,13 @@ Model Prediction:
 """
 
 
+# An answer line that opens with an option letter: "B. 8", "(B) 8", "B) 8",
+# "B: 8". A bare "B" is not here on purpose -- the last-line fallback already
+# returns it -- and neither is "Because ...", which needs the punctuation to
+# match and so is left to the scans below.
+_MCQ_ANSWER_LINE = re.compile(r"^(?:\([A-H]\)|[A-H][.):])(?:\s|$)")
+
+
 def extract_boxed_answer(predict_str: str) -> str:
     """Extract the answer from \boxed{} format.
 
@@ -150,9 +157,20 @@ def extract_anwser_tag(predict_str: str) -> str:
         if after_think:
             return after_think
 
+    lines = predict_str.strip().split("\n")
+    last_line = next((line.strip() for line in reversed(lines) if line.strip()), "")
+
+    # A multiple-choice answer is usually the option LETTER plus that option's
+    # own text -- "B. 8" -- and the numeric scan below would hand back "8",
+    # which is not an option letter and scores 0 against a ground truth of "B".
+    # WeMath's options are numbers, so that discarded 336 of its 1,740 answers:
+    # 56.6% instead of 75.9%. Return the line whole and let relax_exact_match
+    # parse the letter out of it, exactly as for the untagged case below.
+    if _MCQ_ANSWER_LINE.match(last_line):
+        return last_line
+
     # If neither format found, try to extract the last number or expression
     # This is a fallback for cases where the answer is just stated without formatting
-    lines = predict_str.strip().split("\n")
     for line in reversed(lines):
         # Look for patterns like "The answer is 204" or just "204"
         if line.strip():
@@ -170,11 +188,7 @@ def extract_anwser_tag(predict_str: str) -> str:
     # not the whole string: handing a full chain to relax_exact_match lets
     # parse_mcq pick an option letter out of the reasoning, which is how
     # vstar_bench used to score the wrong choice.
-    for line in reversed(lines):
-        if line.strip():
-            return line.strip()
-
-    return ""
+    return last_line
 
 
 def format_reward(predict_str: str) -> float:
