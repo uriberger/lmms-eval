@@ -14,9 +14,17 @@ def _extract_answer_letter(text: str) -> str:
     'C' -> 'C'
     '(C)' -> 'C'
     'A.' -> 'A'
+    '<think>...</think>\n\nB' -> 'B'
+
+    The match is anchored at the start of the string, which for a reasoning
+    model means it never matched anything: the response opens with '<think>',
+    so every item scored 0. Drop the reasoning block first, as pope and
+    illusionvqa do, and score the answer that follows it.
 
     Return an empty string if no letter is found.
     """
+    if "</think>" in text:
+        text = text.rsplit("</think>", 1)[1]
     text = text.strip()
     match = re.match(r"[\(\s]*([A-Z])[\)\.\s]*", text, flags=re.IGNORECASE)
     if match:

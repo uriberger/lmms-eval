@@ -42,7 +42,17 @@ def vstar_doc_to_text(doc, lmms_eval_specific_kwargs=None):
 
 
 def extract_answer_letter(response):
-    """Extract the answer letter from model response."""
+    """Extract the answer letter from model response.
+
+    Every pattern below is an unanchored `re.search` over the whole response,
+    which for a reasoning model reads the letter out of the THINKING rather
+    than the answer: a chain that says "at first glance the answer is A ...
+    but" scores A even when it concludes B, and one that enumerates "Option A:
+    ..." scores A whatever it picks. Take the segment after the reasoning
+    block, as pope and illusionvqa do, and search only that.
+    """
+    if "</think>" in response:
+        response = response.rsplit("</think>", 1)[1]
     # Clean the response
     response = response.strip().upper()
 
