@@ -60,8 +60,20 @@ def hrbench_process_results(doc, results):
         results: [pred]
     Returns:
         a dictionary with key: metric name, value: metric value
+
+    The reasoning block is dropped before scoring, as pope and illusionvqa do.
+    HRBenchEval only calls the GPT judge when it cannot read an option out of
+    the text locally, and a <think>...</think> chain defeats that shortcut every
+    time: the reasoning mentions several options, so can_infer cannot tell the
+    chosen one from the ones merely considered and returns False. That sends
+    every item to the judge -- 800 serial calls at max_workers 1, and with no
+    OPENAI_API_KEY set get_chat_response returns without writing
+    'gpt_prediction', so the lookup below raises KeyError instead of scoring.
     """
-    pred = results[0].strip()
+    pred = results[0]
+    if "</think>" in pred:
+        pred = pred.rsplit("</think>", 1)[1]
+    pred = pred.strip()
     gt = doc["answer"]
     options = hrbench_doc_to_options(doc)
     question = doc["question"]
