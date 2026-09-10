@@ -3,10 +3,11 @@ from typing import Any, Dict, List, Literal, Optional, Tuple, Union
 
 import numpy as np
 from PIL import Image
-from pydantic import BaseModel
+from pydantic import BaseModel, model_validator
 
 from lmms_eval.imports import optional_import
 from lmms_eval.models.model_utils.media_encoder import encode_image_to_base64
+from lmms_eval.prompt_utils import strip_answer_format_in_messages
 
 # Optional video processing dependencies
 VideoReader, _has_decord = optional_import("decord", "VideoReader")
@@ -44,6 +45,15 @@ class ChatMessage(BaseModel):
 
 class ChatMessages(BaseModel):
     messages: List[ChatMessage]
+
+    @model_validator(mode="after")
+    def _strip_answer_format(self):
+        # No-op unless LMMS_STRIP_ANSWER_FORMAT_INSTRUCTION is set. Here rather
+        # than in a model wrapper because every chat wrapper funnels through
+        # this type, so one hook covers them all -- including subclasses that
+        # only wrap generate_until.
+        strip_answer_format_in_messages(self.messages)
+        return self
 
     def extract_media(self):
         images = []

@@ -90,3 +90,28 @@ def strip_answer_format_instructions(text: str, task: str = "") -> str:
         _reported.add(key)
         eval_logger.info(f"[{_ENV}] {key}: removed {len(removed)} answer-format instruction(s) per prompt")
     return out
+
+
+def strip_answer_format_in_messages(messages) -> None:
+    """The same edit, in place, over the text parts of every USER turn.
+
+    The two model families reach the prompt by different routes: the simple
+    wrappers receive a rendered `contexts` string, the chat wrappers receive a
+    message list from the task's doc_to_messages. `--model qwen3_vl` resolves to
+    the CHAT class, which subclasses the simple one but overrides generate_until
+    -- so hooking only the string path did nothing whatsoever. The env var was
+    set, the code ran, the score came back bit-identical, and the instruction
+    reached the model untouched. Hence this hook lives on ChatMessages, which
+    every chat wrapper constructs, instead of in any single wrapper.
+
+    System turns are deliberately left alone: that is where the reasoning
+    instruction we WANT lives.
+    """
+    if not strip_answer_format_enabled():
+        return
+    for message in messages:
+        if getattr(message, "role", None) != "user":
+            continue
+        for content in getattr(message, "content", None) or []:
+            if getattr(content, "type", None) == "text" and getattr(content, "text", None):
+                content.text = strip_answer_format_instructions(content.text)
