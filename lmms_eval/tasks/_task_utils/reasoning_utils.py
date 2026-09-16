@@ -67,11 +67,54 @@ Model Prediction:
 """
 
 
+# Bumped whenever a change here would move a banked score. vlm_reasoning's
+# scripts/rescore_reasoning_tasks.py stamps this into every results.json it
+# rewrites, and visualize/results_table.py flags a row whose stamp does not
+# match -- because the alternative is what happened on 2026-09-10, when two
+# LogicVista runs of the SAME checkpoint sat in one table at 0.45% and 56.2%
+# and nothing in either file said they had been scored by different code.
+PARSER_VERSION = "2026-09-16-mcq-cue"
+
 # An answer line that opens with an option letter: "B. 8", "(B) 8", "B) 8",
 # "B: 8". A bare "B" is not here on purpose -- the last-line fallback already
 # returns it -- and neither is "Because ...", which needs the punctuation to
 # match and so is left to the scans below.
 _MCQ_ANSWER_LINE = re.compile(r"^(?:\([A-H]\)|[A-H][.):])(?:\s|$)")
+
+# The words a model puts in front of its final choice. Longest first, so
+# "final answer" is preferred over the "answer" inside it.
+_ANSWER_CUE = re.compile(
+    r"(?:final\s+answer|correct\s+answer|correct\s+option|correct\s+choice|best\s+answer|answer|option|choice)",
+    re.I,
+)
+# A standalone option letter. \b on both sides is what keeps it from matching
+# the "A" of "All" or the "C" of "Correct"; markdown emphasis and brackets
+# around the letter are word boundaries, so "**D**" and "(C)" both match.
+_OPTION_LETTER = re.compile(r"\b([A-H])\b")
+# How far past a cue the letter may sit. "Answer: **(C) Neither set A nor set
+# B**" needs a dozen characters; anything beyond this is prose that happens to
+# follow a cue, not the answer to it.
+_CUE_WINDOW = 60
+# How many trailing lines of a free-form chain may hold the final answer. A
+# model that closes with "### Final Answer:" on one line and "**(C) 500
+# increase**" on the next needs more than one; a whole chain would let a cue
+# from the middle of the reasoning win.
+_ANSWER_TAIL_LINES = 4
+
+
+def _letter_after_cue(text: str) -> str:
+    """The option letter introduced by the LAST answer cue in ``text``, if any.
+
+    Deliberately searches the window *after* the cue. Searching from the cue's
+    own start is the bug this replaces: ``parse_mcq("Answer: E")`` returned
+    "A" -- the A of "Answer" -- and "Final Answer: **D**" returned "F".
+    """
+    best = ""
+    for cue in _ANSWER_CUE.finditer(text):
+        m = _OPTION_LETTER.search(text[cue.end() : cue.end() + _CUE_WINDOW])
+        if m:
+            best = m.group(1).upper()
+    return best
 
 
 def extract_boxed_answer(predict_str: str) -> str:
@@ -168,6 +211,27 @@ def extract_anwser_tag(predict_str: str) -> str:
     # parse the letter out of it, exactly as for the untagged case below.
     if _MCQ_ANSWER_LINE.match(last_line):
         return last_line
+
+    # An answer line that STATES its letter rather than opening with it --
+    # "**Answer: A**", "### Final Answer: **D**", "I choose (B)". The rule above
+    # only matches a line that begins with the letter, so these fell through to
+    # the numeric scan below, which walks BACKWARDS over every earlier line and
+    # returns the first trailing number it meets: a chain ending "Step 2: the
+    # count is 12.\n**Answer: A**" was extracted as "12". Return the line whole
+    # and let relax_exact_match/parse_mcq take the letter out of it, exactly as
+    # for the case above.
+    # Read the tail as one blob rather than line by line: a chain that closes
+    # with "### Final Answer:" and puts "**(C) 500 increase**" on the NEXT line
+    # has the cue and the letter in different lines, and neither alone is an
+    # answer. The line carrying the letter is what comes back, so the string
+    # handed on stays short enough for relax_exact_match's substring rules.
+    tail_lines = lines[-_ANSWER_TAIL_LINES:]
+    tail = "\n".join(tail_lines)
+    for cue in reversed(list(_ANSWER_CUE.finditer(tail))):
+        m = _OPTION_LETTER.search(tail[cue.end() : cue.end() + _CUE_WINDOW])
+        if m:
+            hit = cue.end() + m.start(1)
+            return tail[: hit + 1].rsplit("\n", 1)[-1] + tail[hit + 1 :].split("\n", 1)[0]
 
     # If neither format found, try to extract the last number or expression
     # This is a fallback for cases where the answer is just stated without formatting
@@ -298,53 +362,31 @@ def parse_mcq(predict_str: str) -> str:
         if f"{choice}=" in response:
             candidates.append((choice, response.rfind(f"{choice}="), "equals"))
 
-    # Pattern 9: Look for common answer phrases followed by choices
-    answer_phrases = [
-        "the answer is",
-        "answer is",
-        "the correct answer is",
-        "correct answer is",
-        "the answer",
-        "answer",
-        "correct answer",
-        "the correct answer",
-        "the best answer is",
-        "best answer is",
-        "the best answer",
-        "best answer",
-        "the option is",
-        "option is",
-        "the correct option is",
-        "correct option is",
-        "the choice is",
-        "choice is",
-        "the correct choice is",
-        "correct choice is",
-        "i choose",
-        "i select",
-        "i pick",
-        "my answer is",
-        "my choice is",
-    ]
+    # Pattern 9: an answer cue ("final answer", "the answer is", "I choose", ...)
+    # followed by an option letter.
+    #
+    # The letter belongs to the window AFTER the cue, not to the cue itself.
+    # This used to scan from the cue's own start, so the first letter it found
+    # was the one inside the cue word: "Answer: E" -> A, "Final Answer: **D**"
+    # -> F, "Correct Answer: D. All dogs can swim." -> C. Because that only
+    # fires on untagged prose it scored a reasoning model's plain-letter output
+    # fine and wrecked every free-form baseline -- LogicVista read 15.8% for
+    # Qwen3-VL-8B-Instruct where the corrected window reads 52.5%.
+    #
+    # Only the LAST cue is offered. The sort below breaks priority ties toward
+    # the EARLIEST position, so handing it every cue in a long chain would let
+    # "the answer to step 1 is A" outrank the "Final Answer: D" that closes it.
+    cue_letter = _letter_after_cue(response)
+    if cue_letter:
+        candidates.append((cue_letter, len(response), "phrase"))
 
-    for phrase in answer_phrases:
-        if phrase in response.lower():
-            phrase_start = response.lower().find(phrase)
-            # Look for choices after the phrase
-            for choice in all_choices:
-                choice_pos = response.find(choice, phrase_start)
-                if choice_pos != -1:
-                    candidates.append((choice, choice_pos, "phrase"))
-
-    # Pattern 10: Look for choices at the very beginning of the response
-    for choice in all_choices:
-        if response.strip().startswith(choice):
-            candidates.append((choice, 0, "start"))
-
-    # Pattern 11: Look for choices at the very end of the response
-    for choice in all_choices:
-        if response.strip().endswith(choice):
-            candidates.append((choice, len(response) - 1, "end"))
+    # Patterns 10 and 11: the response IS an option letter -- "C", "(C)", "C.".
+    # Restricted to that case on purpose. They outrank every other pattern, so
+    # applied to prose they let the "B" of a reply opening "Based on the
+    # pattern..." beat the explicit cue at the end of the same sentence.
+    bare = response.strip().strip("()*").strip()
+    if len(bare) == 1 and bare.upper() in all_choices:
+        candidates.append((bare.upper(), 0, "start"))
 
     # Pattern 12: Look for choices with numbers (e.g., "1. A", "2. B")
     for i, choice in enumerate(all_choices):
