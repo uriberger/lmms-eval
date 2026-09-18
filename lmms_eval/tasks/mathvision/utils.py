@@ -1,4 +1,5 @@
 import os
+import re
 import threading
 
 from loguru import logger as eval_logger
@@ -25,6 +26,20 @@ except ImportError as e:
     find_math_answer = is_equal = is_number = _missing_eval_utils
 
 NUM_SECONDS_TO_SLEEP = 5
+
+# Bumped whenever mathvision_process_results changes what it extracts from a
+# response, so a banked results.json can say which build scored it and the
+# results table can flag the ones that predate the current parser. Rewritten by
+# vlm_reasoning/scripts/rescore_mathvision.py, which replays the stored text
+# through the function below -- see that script's header.
+PARSER_VERSION = "2026-09-17-option-letter"
+
+# An answer that OPENS with an option letter: "B. B", "(D) 5", "A) 12", "C: x".
+# The shortcut below this only ever caught a letter at the very end (" B.") or a
+# letter alone on the first line ("B\n"); a model that names the option and then
+# restates its text fell through to find_math_answer, which folds "B. B" into
+# "b.b" and compares that to a ground truth of "B".
+_OPTION_LETTER_PREFIX = re.compile(r"^\(?([A-Z])\)?[.):](?:\s|$)")
 
 # Lazy pipeline singleton for GPT-based evaluation
 _pipeline = None
@@ -105,6 +120,20 @@ def mathvision_process_results(doc, results):
         for c in "ABCDE":
             if model_answer.endswith(f" {c}.") or model_answer.endswith(f" ({c}).") or model_answer.startswith(f"{c}\n") or model_answer.startswith(f"({c})\n") or model_answer.startswith(f"({c}) {c}\n"):
                 model_answer = c
+        # The prompt asks for "the option's letter from the given choices", and a
+        # reasoning model answers it by naming the letter AND restating the
+        # choice: "B. B", "A. Carriage and Aeroplane", "D. (D)". None of the
+        # shapes above match that, so it reached find_math_answer whole and came
+        # back as "b.b" -- never equal to either the letter or the option value.
+        # On MathVision's 191 multiple-choice testmini docs that cost the EASE
+        # checkpoint 53 correct answers: 8.9%, below the 20% chance rate for five
+        # options, against 36.6% once the letter is read. Keep it behind the
+        # options check so a free-form answer that happens to open "A) ..." is
+        # still scored as the expression it is.
+        letters = [chr(ord("A") + i) for i in range(len(doc["options"]))]
+        prefix = _OPTION_LETTER_PREFIX.match(model_answer)
+        if prefix and prefix.group(1) in letters:
+            model_answer = prefix.group(1)
         if is_number(model_answer.split("is ")[-1].rstrip(".")):
             model_answer = model_answer.split("is ")[-1].rstrip(".")
         if "oxed{" not in model_answer:
