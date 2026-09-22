@@ -115,12 +115,129 @@ def _sanitize_run_id(run_id: str) -> str:
     return sanitized or "run"
 
 
-def _recover_killed_runs(cache_root: str, target_db: str, current_run_dir: str) -> None:
-    """Merge data from runs that were killed before finalize() could run.
+def _shard_state(shard_paths: List[str]) -> Dict[str, List[int]]:
+    """(size, mtime_ns) per shard, as of now — the watermark a merge records."""
+    state: Dict[str, List[int]] = {}
+    for path in shard_paths:
+        try:
+            st = os.stat(path)
+        except OSError:
+            continue
+        state[os.path.basename(path)] = [st.st_size, st.st_mtime_ns]
+    return state
 
-    A killed run has rank_*.db files with committed rows but no .merged marker.
-    We merge those rows into cache.db at startup so the next run can serve them
-    from shared_db_path instead of re-running inference.
+
+def _read_merge_marker(run_dir: str) -> Optional[dict]:
+    """Parse a run's merge watermark, or None if it was never merged.
+
+    Legacy markers hold a bare float timestamp. They are read as a watermark
+    with no per-shard state, so any shard modified after that timestamp still
+    counts as unmerged — which is how the rows those markers stranded get
+    recovered on the next startup.
+    """
+    try:
+        with open(os.path.join(run_dir, _LAYERED_MERGED_MARKER), "r", encoding="utf-8") as handle:
+            raw = handle.read().strip()
+    except OSError:
+        return None
+    marker: dict = {"merged_at": 0.0, "shards": {}, "audits": {}}
+    if not raw:
+        return marker
+    try:
+        parsed = json.loads(raw)
+    except ValueError:
+        parsed = None
+    if isinstance(parsed, dict):
+        marker.update({k: v for k, v in parsed.items() if v is not None})
+        return marker
+    try:
+        marker["merged_at"] = float(raw)
+    except ValueError:
+        pass
+    return marker
+
+
+def _write_merge_marker(run_dir: str, shard_state: Dict[str, List[int]], audit_offsets: Dict[str, int]) -> None:
+    payload = {
+        "merged_at": time.time(),
+        "shards": shard_state,
+        "audits": {os.path.basename(path): offset for path, offset in audit_offsets.items()},
+    }
+    _touch_text(os.path.join(run_dir, _LAYERED_MERGED_MARKER), json.dumps(payload, sort_keys=True) + "\n")
+
+
+def _unmerged_shards(run_dir: str, shard_paths: List[str]) -> List[str]:
+    """Shards holding rows that cache.db has not been given yet.
+
+    A merge does not finish a run directory off. The suite runs one lmms-eval
+    invocation per benchmark under a single run id, so the same rank_*.db keeps
+    growing after an earlier benchmark merged it; and a concurrent job's startup
+    recovery merges-and-marks runs that are still generating. Either way the
+    marker exists while rows written after it do not, so membership is decided
+    per shard, by size/mtime against the last merge, not by the marker's mere
+    presence.
+    """
+    marker = _read_merge_marker(run_dir)
+    if marker is None:
+        return list(shard_paths)
+    recorded = marker.get("shards") or {}
+    merged_at = marker.get("merged_at") or 0.0
+    pending = []
+    for path in shard_paths:
+        try:
+            st = os.stat(path)
+        except OSError:
+            continue
+        known = recorded.get(os.path.basename(path))
+        if known is None:
+            # Legacy marker: no per-shard state, so fall back to its timestamp.
+            if st.st_mtime > merged_at:
+                pending.append(path)
+        elif [st.st_size, st.st_mtime_ns] != list(known):
+            pending.append(path)
+    return pending
+
+
+def _audit_offsets(run_dir: str, audit_paths: List[str]) -> Dict[str, int]:
+    """Bytes of each audit log already appended to the root audit log."""
+    marker = _read_merge_marker(run_dir) or {}
+    recorded = marker.get("audits") or {}
+    offsets = {}
+    for path in audit_paths:
+        try:
+            offsets[path] = int(recorded.get(os.path.basename(path), 0))
+        except (TypeError, ValueError):
+            offsets[path] = 0
+    return offsets
+
+
+def _merge_run_dir(run_dir: str, target_db: str, target_audit: str) -> int:
+    """Merge a run's shards into the root cache, then record the watermark.
+
+    Returns the number of rows inserted. The watermark is snapshotted BEFORE
+    the merge reads anything, so rows appended while it runs are seen as
+    pending next time rather than silently covered by the marker.
+    """
+    rank_dbs = sorted(glob(os.path.join(run_dir, "rank_*.db")))
+    rank_audits = sorted(glob(os.path.join(run_dir, "rank_*.audit.jsonl")))
+    if not rank_dbs:
+        return 0
+    shard_state = _shard_state(rank_dbs)
+    offsets = _audit_offsets(run_dir, rank_audits)
+    merged = ResponseCache.merge_shards(rank_dbs, target_db)
+    if rank_audits:
+        ResponseCache.merge_audit_logs(rank_audits, target_audit, offsets)
+    _write_merge_marker(run_dir, shard_state, offsets)
+    return merged
+
+
+def _recover_killed_runs(cache_root: str, target_db: str, current_run_dir: str) -> None:
+    """Promote rows earlier runs wrote but never got into cache.db.
+
+    A run killed before finalize() has rank_*.db files with committed rows and
+    no marker at all. A run that was already merged can still have grown since
+    (see ``_unmerged_shards``). Both are recovered here at startup, so the next
+    run serves them from shared_db_path instead of re-running inference.
     """
     run_root = os.path.join(cache_root, _LAYERED_RUNS_DIRNAME)
     if not os.path.isdir(run_root):
@@ -131,27 +248,24 @@ def _recover_killed_runs(cache_root: str, target_db: str, current_run_dir: str) 
     for entry in sorted(os.scandir(run_root), key=lambda e: e.name):
         if not entry.is_dir() or entry.path == current_run_dir:
             continue
-        if os.path.exists(os.path.join(entry.path, _LAYERED_MERGED_MARKER)):
-            continue
         rank_dbs = sorted(glob(os.path.join(entry.path, "rank_*.db")))
-        rank_audits = sorted(glob(os.path.join(entry.path, "rank_*.audit.jsonl")))
         if not rank_dbs:
             continue
-        # Only bother if at least one db has rows.
+        pending = _unmerged_shards(entry.path, rank_dbs)
+        if not pending:
+            continue
+        # Only bother if at least one pending db has rows.
         has_data = any(
             sqlite3.connect(db, timeout=5).execute("SELECT COUNT(*) FROM responses").fetchone()[0] > 0
-            for db in rank_dbs
+            for db in pending
             if os.path.getsize(db) > 0
         )
         if not has_data:
             continue
         try:
             with _merge_lock(lock_dir, timeout_seconds=10):
-                merged = ResponseCache.merge_shards(rank_dbs, target_db)
-                if rank_audits:
-                    ResponseCache.merge_audit_logs(rank_audits, target_audit)
-                _touch_text(os.path.join(entry.path, _LAYERED_MERGED_MARKER), f"{time.time():.6f}\n")
-                eval_logger.info(f"ResponseCache: recovered {merged} entries from killed run {entry.name}")
+                merged = _merge_run_dir(entry.path, target_db, target_audit)
+                eval_logger.info(f"ResponseCache: recovered {merged} entries from unmerged run {entry.name}")
         except Exception as exc:
             eval_logger.warning(f"ResponseCache: recovery merge failed for {entry.name}: {exc}")
 
@@ -1168,16 +1282,22 @@ class ResponseCache:
                 # Mark current run as ready
                 _touch_text(os.path.join(self._run_dir, _LAYERED_READY_MARKER), f"{time.time():.6f}\n")
 
+                # Snapshot the shards before reading them. The next benchmark in
+                # this job appends to these same files, so a watermark taken
+                # after the merge would cover rows it never read.
+                shard_state = _shard_state(shard_dbs)
+                offsets = _audit_offsets(self._run_dir, shard_audits)
+
                 # Merge current run
                 if shard_dbs:
                     merged = ResponseCache.merge_shards(shard_dbs, target_db)
                     eval_logger.info(f"ResponseCache: merged {merged} entries from {len(shard_dbs)} rank(s) into {target_db}")
                 if shard_audits:
-                    merged_lines = ResponseCache.merge_audit_logs(shard_audits, target_audit)
+                    merged_lines = ResponseCache.merge_audit_logs(shard_audits, target_audit, offsets)
                     eval_logger.info(f"ResponseCache: merged {merged_lines} audit entries into {target_audit}")
 
-                # Mark merged
-                _touch_text(os.path.join(self._run_dir, _LAYERED_MERGED_MARKER), f"{time.time():.6f}\n")
+                # Record how far each shard has been merged
+                _write_merge_marker(self._run_dir, shard_state, offsets)
 
                 # Opportunistically merge any other ready-but-unmerged runs
                 self._merge_stale_runs(run_root, target_db, target_audit)
@@ -1186,13 +1306,11 @@ class ResponseCache:
             eval_logger.warning(f"ResponseCache: merge deferred, lock busy: {exc}")
 
     def _merge_stale_runs(self, run_root: str, target_db: str, target_audit: str) -> None:
-        """Merge any previous runs that are ready but not yet merged."""
+        """Merge any previous run that is ready but has shards cache.db lacks."""
         for entry in sorted(os.scandir(run_root), key=lambda e: e.name):
             if not entry.is_dir() or entry.path == self._run_dir:
                 continue
-            ready = os.path.join(entry.path, _LAYERED_READY_MARKER)
-            merged = os.path.join(entry.path, _LAYERED_MERGED_MARKER)
-            if not os.path.exists(ready) or os.path.exists(merged):
+            if not os.path.exists(os.path.join(entry.path, _LAYERED_READY_MARKER)):
                 continue
 
             shard_dbs = sorted(glob(os.path.join(entry.path, "rank_*.db")))
@@ -1209,11 +1327,15 @@ class ResponseCache:
                 if not shard_audits and os.path.exists(single):
                     shard_audits = [single]
 
-            if shard_dbs:
-                ResponseCache.merge_shards(shard_dbs, target_db)
+            if not shard_dbs or not _unmerged_shards(entry.path, shard_dbs):
+                continue
+
+            shard_state = _shard_state(shard_dbs)
+            offsets = _audit_offsets(entry.path, shard_audits)
+            ResponseCache.merge_shards(shard_dbs, target_db)
             if shard_audits:
-                ResponseCache.merge_audit_logs(shard_audits, target_audit)
-            _touch_text(os.path.join(entry.path, _LAYERED_MERGED_MARKER), f"{time.time():.6f}\n")
+                ResponseCache.merge_audit_logs(shard_audits, target_audit, offsets)
+            _write_merge_marker(entry.path, shard_state, offsets)
             eval_logger.info(f"ResponseCache: merged stale run {entry.name}")
 
     @staticmethod
@@ -1256,12 +1378,18 @@ class ResponseCache:
         return total
 
     @staticmethod
-    def merge_audit_logs(audit_paths: List[str], output_path: str) -> int:
+    def merge_audit_logs(audit_paths: List[str], output_path: str, offsets: Optional[Dict[str, int]] = None) -> int:
         """Merge per-rank JSONL audit logs into a single file.
 
         Appends entries from all ``audit_paths`` into ``output_path``,
         sorted by ``created_at`` timestamp.  Deduplicates by ``cache_key``
         for deterministic entries; non-deterministic entries are always kept.
+
+        ``offsets`` maps an audit path to the byte offset already merged, and is
+        updated in place with the new end offsets.  A run directory is merged
+        more than once -- once per benchmark, plus whenever it grows after being
+        marked -- so without this every merge would re-append the whole log.
+        Read in binary because these are raw byte offsets, not text cookies.
 
         Returns the number of lines written.
         """
@@ -1270,9 +1398,22 @@ class ResponseCache:
         for path in audit_paths:
             if not os.path.exists(path):
                 continue
-            with open(path, "r", encoding="utf-8") as f:
-                for line in f:
-                    line = line.strip()
+            with open(path, "rb") as f:
+                start = int((offsets or {}).get(path, 0))
+                if start:
+                    try:
+                        f.seek(start)
+                    except OSError:
+                        start = 0
+                        f.seek(0)
+                consumed = start
+                for raw_line in f:
+                    if not raw_line.endswith(b"\n"):
+                        # Torn tail: a rank is still appending. Leave the offset
+                        # short of it so the next merge reads the whole line.
+                        break
+                    consumed += len(raw_line)
+                    line = raw_line.decode("utf-8", errors="replace").strip()
                     if not line:
                         continue
                     try:
@@ -1286,6 +1427,8 @@ class ResponseCache:
                             continue
                         seen_keys.add(ck)
                     entries.append(rec)
+                if offsets is not None:
+                    offsets[path] = consumed
 
         # Sort by created_at for chronological ordering
         entries.sort(key=lambda r: r.get("created_at", 0))

@@ -13,6 +13,7 @@ from lmms_eval.caching.response_cache import (
     _SCHEMA_VERSION,
     ResponseCache,
     _extract_content_hash,
+    _recover_killed_runs,
     compute_cache_key,
     extract_gen_kwargs,
     is_deterministic,
@@ -589,6 +590,121 @@ class TestCreateAndFinalize(_CacheTestBase):
         # Root cache.db should NOT have been created
         target_db = os.path.join(cache_root, "cache.db")
         self.assertFalse(os.path.exists(target_db))
+
+
+# ===========================================================================
+# Integration - recovery of unmerged run directories
+# ===========================================================================
+
+
+class TestUnmergedRunRecovery(_CacheTestBase):
+    """The merge marker records how far a run was merged, not that it is done.
+
+    A run directory keeps growing after it has been merged: the suite runs one
+    lmms-eval invocation per benchmark under a single run id, and a job starting
+    up merges-and-marks sibling runs that are still generating. Treating the
+    marker as terminal stranded every response written after it, which made a
+    long benchmark restart from scratch after each wall-clock kill.
+    """
+
+    def _write_shard(self, run_dir, rank, prompts, start_doc=0):
+        db = os.path.join(run_dir, f"rank_{rank}.db")
+        audit = os.path.join(run_dir, f"rank_{rank}.audit.jsonl")
+        cache = ResponseCache(db, audit, model_fingerprint="model_A")
+        cache.execute(
+            _mock_model([f"answer_{p}" for p in prompts]),
+            "generate_until",
+            [_gen_request(p, doc_id=start_doc + i) for i, p in enumerate(prompts)],
+        )
+        cache.close()
+        return db, audit
+
+    def _new_run_dir(self, name="job-1"):
+        cache_root = os.path.join(self.tmpdir, "root")
+        run_dir = os.path.join(cache_root, "runs", name)
+        os.makedirs(run_dir, exist_ok=True)
+        return cache_root, run_dir
+
+    def _recover(self, cache_root):
+        _recover_killed_runs(
+            cache_root,
+            os.path.join(cache_root, "cache.db"),
+            os.path.join(cache_root, "runs", "some-other-live-run"),
+        )
+
+    def _root_row_count(self, cache_root):
+        db = sqlite3.connect(os.path.join(cache_root, "cache.db"))
+        count = db.execute("SELECT COUNT(*) FROM responses").fetchone()[0]
+        db.close()
+        return count
+
+    def test_rows_written_after_a_merge_are_still_recovered(self):
+        cache_root, run_dir = self._new_run_dir()
+
+        # A sibling job starts and merges what this run has so far.
+        self._write_shard(run_dir, 0, ["p0"])
+        self._recover(cache_root)
+        self.assertEqual(self._root_row_count(cache_root), 1)
+        self.assertTrue(os.path.exists(os.path.join(run_dir, ".merged")))
+
+        # The run was never dead — it keeps generating, then gets killed.
+        time.sleep(0.01)
+        self._write_shard(run_dir, 0, ["p1"], start_doc=1)
+        self._recover(cache_root)
+        self.assertEqual(self._root_row_count(cache_root), 2)
+
+    def test_legacy_timestamp_marker_does_not_strand_newer_rows(self):
+        cache_root, run_dir = self._new_run_dir()
+        self._write_shard(run_dir, 0, ["p0"])
+        # Pre-watermark marker format: a bare timestamp, stamped before the
+        # shard was written. Its rows must still be recoverable.
+        with open(os.path.join(run_dir, ".merged"), "w", encoding="utf-8") as fh:
+            fh.write(f"{time.time() - 60:.6f}\n")
+
+        self._recover(cache_root)
+
+        self.assertEqual(self._root_row_count(cache_root), 1)
+
+    def test_unchanged_run_is_not_merged_twice(self):
+        cache_root, run_dir = self._new_run_dir()
+        self._write_shard(run_dir, 0, ["p0"])
+        self._recover(cache_root)
+        audit_size = os.path.getsize(os.path.join(cache_root, "cache.audit.jsonl"))
+
+        self._recover(cache_root)
+
+        self.assertEqual(os.path.getsize(os.path.join(cache_root, "cache.audit.jsonl")), audit_size)
+
+    def test_audit_merge_appends_only_the_new_tail(self):
+        _cache_root, run_dir = self._new_run_dir()
+        _db, audit = self._write_shard(run_dir, 0, ["p0"])
+        out = os.path.join(self.tmpdir, "merged.jsonl")
+        offsets = {}
+
+        self.assertEqual(ResponseCache.merge_audit_logs([audit], out, offsets), 1)
+        self.assertEqual(offsets[audit], os.path.getsize(audit))
+        # Nothing appended since the last merge.
+        self.assertEqual(ResponseCache.merge_audit_logs([audit], out, offsets), 0)
+
+        self._write_shard(run_dir, 0, ["p1"], start_doc=1)
+        self.assertEqual(ResponseCache.merge_audit_logs([audit], out, offsets), 1)
+
+    def test_torn_final_line_is_merged_once_complete(self):
+        _cache_root, run_dir = self._new_run_dir()
+        _db, audit = self._write_shard(run_dir, 0, ["p0"])
+        out = os.path.join(self.tmpdir, "merged.jsonl")
+        offsets = {}
+        ResponseCache.merge_audit_logs([audit], out, offsets)
+
+        # A rank is mid-append: the last line has no newline yet.
+        partial = json.dumps({"cache_key": "k9", "request_type": "generate_until", "task_name": "t", "doc_id": 9, "response": "r", "deterministic": True})
+        with open(audit, "a", encoding="utf-8") as fh:
+            fh.write(partial[:10])
+        self.assertEqual(ResponseCache.merge_audit_logs([audit], out, offsets), 0)
+
+        with open(audit, "a", encoding="utf-8") as fh:
+            fh.write(partial[10:] + "\n")
+        self.assertEqual(ResponseCache.merge_audit_logs([audit], out, offsets), 1)
 
 
 # ===========================================================================
